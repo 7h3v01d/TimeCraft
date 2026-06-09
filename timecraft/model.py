@@ -1,0 +1,403 @@
+# model.py
+
+import random
+import time
+import json
+import os
+from collections import deque
+import math
+
+import pyglet
+from pyglet.gl import gl
+from pyglet import image
+
+import config
+from noise_gen import NoiseGen
+from util import sectorize, cube_vertices, normalize
+
+# Indices to convert 6 quads (each 4 verts) into triangles
+# Each face: verts 0,1,2 and 0,2,3
+QUAD_INDICES = []
+for _face in range(6):
+    base = _face * 4
+    QUAD_INDICES += [base, base+1, base+2, base, base+2, base+3]
+
+# Map texture list -> save string and back
+_TEXTURE_NAMES = {
+    'GRASS': config.GRASS, 'SAND': config.SAND, 'BRICK': config.BRICK,
+    'STONE': config.STONE, 'WOOD': config.WOOD, 'LEAF': config.LEAF,
+    'WATER': config.WATER, 'CRYSTAL': config.CRYSTAL,
+    'MAGIC_WATER': config.MAGIC_WATER,
+    'DIRT': config.DIRT, 'SNOW': config.SNOW,
+    'GLASS': config.GLASS, 'PLANKS': config.PLANKS, 'GRAVEL': config.GRAVEL,
+}
+_TEXTURE_LOOKUP = {tuple(v): k for k, v in _TEXTURE_NAMES.items()}
+
+
+def _make_default_shader():
+    vert_src = """
+#version 330 core
+in vec3 position;
+in vec2 tex_coords;
+out vec2 v_texcoord;
+uniform mat4 view;
+uniform mat4 projection;
+void main() {
+    gl_Position = projection * view * vec4(position, 1.0);
+    v_texcoord = tex_coords;
+}
+"""
+    frag_src = """
+#version 330 core
+in vec2 v_texcoord;
+out vec4 out_color;
+uniform sampler2D our_texture;
+void main() {
+    out_color = texture(our_texture, v_texcoord);
+}
+"""
+    return pyglet.graphics.shader.ShaderProgram(
+        pyglet.graphics.shader.Shader(vert_src, 'vertex'),
+        pyglet.graphics.shader.Shader(frag_src, 'fragment'),
+    )
+
+
+def _make_water_shader(here):
+    vert_src = open(os.path.join(here, 'water_vertex.glsl')).read()
+    frag_src = open(os.path.join(here, 'water_fragment.glsl')).read()
+    return pyglet.graphics.shader.ShaderProgram(
+        pyglet.graphics.shader.Shader(vert_src, 'vertex'),
+        pyglet.graphics.shader.Shader(frag_src, 'fragment'),
+    )
+
+
+class TextureBindGroup(pyglet.graphics.Group):
+    """Group that binds a texture and sets shader uniforms each draw."""
+    def __init__(self, texture, program, order=0, parent=None):
+        super().__init__(order=order, parent=parent)
+        self.texture = texture
+        self.program = program
+
+    def set_state(self):
+        self.program.use()
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindTexture(self.texture.target, self.texture.id)
+        self.program['our_texture'] = 0
+
+    def unset_state(self):
+        gl.glBindTexture(self.texture.target, 0)
+        self.program.stop()
+
+    def __eq__(self, other):
+        return (isinstance(other, TextureBindGroup) and
+                self.texture == other.texture and
+                self.program == other.program and
+                self.order == other.order and
+                self.parent == other.parent)
+
+    def __hash__(self):
+        return hash((self.texture.id, id(self.program), self.order))
+
+
+class Model(object):
+
+    WORLD_SIZE = 128
+    SAVE_FILE = os.path.join(os.path.dirname(__file__), 'world_save.json')
+
+    def __init__(self):
+        self.batch = pyglet.graphics.Batch()
+
+        _HERE = os.path.dirname(__file__)
+        texture = image.load(config.TEXTURE_PATH).get_texture()
+
+        self.default_shader = _make_default_shader()
+        self.water_shader = _make_water_shader(_HERE)
+
+        self.group = TextureBindGroup(texture, self.default_shader)
+        self.water_group = TextureBindGroup(texture, self.water_shader)
+
+        self.world = {}
+        self.shown = {}
+        self._shown = {}
+        self.sectors = {}
+        self.queue = deque()
+        self.particles = []
+        self.game_time = 0
+        self.seed = None  # set by _initialize or load_world
+        self._initialize()
+
+    # ------------------------------------------------------------------
+    # World generation
+    # ------------------------------------------------------------------
+
+    def _initialize(self):
+        """Load existing world or generate a fresh one."""
+        if os.path.exists(self.SAVE_FILE):
+            self.load_world()
+        else:
+            self._generate_world()
+
+    def _generate_world(self):
+        self.seed = random.randint(0, 1_000_000)
+        n = self.WORLD_SIZE
+        gen = NoiseGen(self.seed)
+        heightMap = [int(gen.getHeight(x, z)) for x in range(n) for z in range(n)]
+
+        for x in range(n):
+            for z in range(n):
+                h = heightMap[x * n + z]
+                if h < 15:
+                    self.add_block((x, h, z), config.SAND, immediate=False)
+                    for y in range(h, 15):
+                        self.add_block((x, y, z),
+                            config.MAGIC_WATER if random.random() > 0.99 else config.WATER,
+                            immediate=False)
+                    continue
+                if h < 18:
+                    self.add_block((x, h, z), config.SAND, immediate=False)
+
+                self.add_block((x, h, z), config.GRASS, immediate=False)
+                for y in range(h - 1, 0, -1):
+                    self.add_block((x, y, z), config.STONE, immediate=False)
+
+                if h > 20 and random.random() > 0.99:
+                    treeHeight = random.randint(5, 7)
+                    for y in range(h + 1, h + treeHeight):
+                        self.add_block((x, y, z), config.WOOD, immediate=False)
+                    leafh = h + treeHeight
+                    for lz in range(z - 2, z + 3):
+                        for lx in range(x - 2, x + 3):
+                            for ly in range(3):
+                                if (lx, leafh + ly, lz) != (x, leafh + ly, z) or random.random() > 0.1:
+                                    self.add_block((lx, leafh + ly, lz), config.LEAF, immediate=False)
+
+                # Dirt layer just below grass surface
+                if h > 18:
+                    for dy in range(1, min(4, h)):
+                        b = (x, h - dy, z)
+                        if b in self.world and self.world[b] == config.STONE:
+                            self.add_block(b, config.DIRT, immediate=False)
+                            break
+
+                # Snow caps on high peaks
+                if h > 30:
+                    self.add_block((x, h, z), config.SNOW, immediate=False)
+
+                # Gravel patches near water edges
+                if 18 <= h <= 20 and random.random() > 0.6:
+                    self.add_block((x, h, z), config.GRAVEL, immediate=False)
+
+                if h > 25 and random.random() > 0.995:
+                    self.add_block((x, h - 1, z), config.CRYSTAL, immediate=False)
+
+    # ------------------------------------------------------------------
+    # Spawn point
+    # ------------------------------------------------------------------
+
+    def get_spawn_point(self):
+        """Return (x, y+2, z) at the highest block near world centre."""
+        cx = cz = self.WORLD_SIZE // 2
+        search_radius = 8
+        best = None
+        for dx in range(-search_radius, search_radius + 1):
+            for dz in range(-search_radius, search_radius + 1):
+                x, z = cx + dx, cz + dz
+                # find highest solid (non-water) block at this column
+                for y in range(60, 0, -1):
+                    if (x, y, z) in self.world:
+                        tex = self.world[(x, y, z)]
+                        if tex not in (config.WATER, config.MAGIC_WATER):
+                            if best is None or y > best[1]:
+                                best = (x, y, z)
+                            break
+        if best:
+            return (float(best[0]), float(best[1] + 2), float(best[2]))
+        return (float(cx), 50.0, float(cz))
+
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+
+    def save_world(self):
+        """Serialise world dict to JSON."""
+        data = {
+            'seed': self.seed,
+            'blocks': [
+                {
+                    'pos': list(pos),
+                    'tex': _TEXTURE_LOOKUP.get(tuple(tex), 'STONE')
+                }
+                for pos, tex in self.world.items()
+            ]
+        }
+        with open(self.SAVE_FILE, 'w') as f:
+            json.dump(data, f, separators=(',', ':'))
+        return len(data['blocks'])
+
+    def load_world(self):
+        """Deserialise world dict from JSON."""
+        with open(self.SAVE_FILE, 'r') as f:
+            data = json.load(f)
+        self.seed = data.get('seed')
+        for entry in data['blocks']:
+            pos = tuple(entry['pos'])
+            tex = _TEXTURE_NAMES.get(entry['tex'], config.STONE)
+            self.add_block(pos, tex, immediate=False)
+
+    def delete_save(self):
+        """Remove save file so next launch regenerates the world."""
+        if os.path.exists(self.SAVE_FILE):
+            os.remove(self.SAVE_FILE)
+
+    # ------------------------------------------------------------------
+    # Core world logic (unchanged)
+    # ------------------------------------------------------------------
+
+    def hit_test(self, position, vector, max_distance=8):
+        m = 8
+        x, y, z = position
+        dx, dy, dz = vector
+        previous = None
+        for _ in range(max_distance * m):
+            key = normalize((x, y, z))
+            if key != previous and key in self.world:
+                return key, previous
+            previous = key
+            x, y, z = x + dx / m, y + dy / m, z + dz / m
+        return None, None
+
+    def exposed(self, position):
+        x, y, z = position
+        for dx, dy, dz in config.FACES:
+            if (x + dx, y + dy, z + dz) not in self.world:
+                return True
+        return False
+
+    def add_block(self, position, texture, immediate=True, hit_vector=None):
+        if position in self.world:
+            self.remove_block(position, immediate)
+        self.world[position] = texture
+        self.sectors.setdefault(sectorize(position, config.SECTOR_SIZE), []).append(position)
+        if immediate:
+            if self.exposed(position):
+                self.show_block(position)
+            self.check_neighbors(position)
+
+    def remove_block(self, position, immediate=True, hit_vector=None):
+        del self.world[position]
+        self.sectors[sectorize(position, config.SECTOR_SIZE)].remove(position)
+        if immediate:
+            if position in self.shown:
+                self.hide_block(position)
+            self.check_neighbors(position)
+
+    def check_neighbors(self, position):
+        x, y, z = position
+        for dx, dy, dz in config.FACES:
+            key = (x + dx, y + dy, z + dz)
+            if key not in self.world:
+                continue
+            if self.exposed(key):
+                if key not in self.shown:
+                    self.show_block(key)
+            else:
+                if key in self.shown:
+                    self.hide_block(key)
+
+    def show_block(self, position, immediate=True):
+        texture = self.world[position]
+        self.shown[position] = texture
+        if immediate:
+            self._show_block(position, texture)
+        else:
+            self._enqueue(self._show_block, position, texture)
+
+    def _show_block(self, position, texture):
+        x, y, z = position
+        vertex_data = cube_vertices(x, y, z, 0.5)
+        texture_data = list(texture)
+
+        is_water = (texture == config.WATER or texture == config.MAGIC_WATER)
+        group = self.water_group if is_water else self.group
+        shader = self.water_shader if is_water else self.default_shader
+
+        vlist = shader.vertex_list_indexed(
+            24, gl.GL_TRIANGLES, QUAD_INDICES,
+            self.batch, group,
+            position=('f', vertex_data),
+            tex_coords=('f', texture_data),
+        )
+        self._shown[position] = vlist
+
+    def hide_block(self, position, immediate=True):
+        self.shown.pop(position)
+        if immediate:
+            self._hide_block(position)
+        else:
+            self._enqueue(self._hide_block, position)
+
+    def _hide_block(self, position):
+        if position in self._shown:
+            self._shown.pop(position).delete()
+
+    def show_sector(self, sector):
+        for position in self.sectors.get(sector, []):
+            if position not in self.shown and self.exposed(position):
+                self.show_block(position, False)
+
+    def hide_sector(self, sector):
+        for position in self.sectors.get(sector, []):
+            if position in self.shown:
+                self.hide_block(position, False)
+
+    def change_sectors(self, before, after):
+        before_set = set()
+        after_set = set()
+        pad = 4
+        for dx in range(-pad, pad + 1):
+            for dy in [0]:
+                for dz in range(-pad, pad + 1):
+                    if dx ** 2 + dy ** 2 + dz ** 2 > (pad + 1) ** 2:
+                        continue
+                    if before:
+                        bx, by, bz = before
+                        before_set.add((bx + dx, by + dy, bz + dz))
+                    if after:
+                        ax, ay, az = after
+                        after_set.add((ax + dx, ay + dy, az + dz))
+        for sector in after_set - before_set:
+            self.show_sector(sector)
+        for sector in before_set - after_set:
+            self.hide_sector(sector)
+
+    def _enqueue(self, func, *args):
+        self.queue.append((func, args))
+
+    def _dequeue(self):
+        func, args = self.queue.popleft()
+        func(*args)
+
+    def process_queue(self):
+        start = time.process_time()
+        while self.queue and time.process_time() - start < 1.0 / config.TICKS_PER_SEC:
+            self._dequeue()
+        dt = 1.0 / config.TICKS_PER_SEC
+        self.game_time += dt
+
+    def process_entire_queue(self):
+        while self.queue:
+            self._dequeue()
+
+    def set_shader_uniforms(self, view_matrix, proj_matrix):
+        """Called each frame to push view/projection into both shaders."""
+        view_flat = list(view_matrix)
+        proj_flat = list(proj_matrix)
+        self.default_shader.use()
+        self.default_shader['view'] = view_flat
+        self.default_shader['projection'] = proj_flat
+        self.default_shader.stop()
+        self.water_shader.use()
+        self.water_shader['view'] = view_flat
+        self.water_shader['projection'] = proj_flat
+        self.water_shader['time'] = self.game_time
+        self.water_shader.stop()
