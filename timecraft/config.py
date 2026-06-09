@@ -260,3 +260,17 @@ def sky_colour(game_time):
             return lerp3(SKY_DUSK, SKY_NIGHT, phase * 2.0)
         else:
             return lerp3(SKY_NIGHT, SKY_DAWN, (phase - 0.5) * 2.0)
+
+# ---------------------------------------------------------------------------
+# Binary save format  (.tcw — TimeCraft World)
+# ---------------------------------------------------------------------------
+SAVE_MAGIC   = b'TCWF'   # 4-byte file magic
+SAVE_VERSION = 1         # bumped if format changes incompatibly
+
+# Stable block ID table — ORDER MUST NEVER CHANGE (it's the on-disk encoding).
+# New block types are appended; existing entries are never moved or removed.
+BLOCK_IDS = [
+    'GRASS', 'SAND', 'BRICK', 'STONE', 'WOOD', 'LEAF',
+    'WATER', 'CRYSTAL', 'MAGIC_WATER', 'DIRT', 'SNOW',
+    'GLASS', 'PLANKS', 'GRAVEL',
+]

@@ -584,19 +584,31 @@ class TestModelSaveLoad(unittest.TestCase):
             m = Model()
         return m
 
+    def _tmp_tcw(self):
+        f = tempfile.NamedTemporaryFile(suffix='.tcw', delete=False)
+        f.close()
+        return f.name
+
+    def _tmp_json(self):
+        f = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
+        f.close()
+        return f.name
+
+    # --- texture lookup (unchanged) ---
+
     def test_texture_lookup_roundtrip(self):
-        """Every named texture survives save->load name conversion."""
         from model import _TEXTURE_NAMES, _TEXTURE_LOOKUP
         for name, tex in _TEXTURE_NAMES.items():
             key = tuple(tex)
             self.assertIn(key, _TEXTURE_LOOKUP, f"{name} missing from lookup")
             self.assertEqual(_TEXTURE_LOOKUP[key], name)
 
+    # --- binary save ---
+
     def test_save_creates_file(self):
         m = self._make_model()
         m.add_block((0, 0, 0), config.GRASS, immediate=False)
-        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
-            tmp = f.name
+        tmp = self._tmp_tcw()
         try:
             m.SAVE_FILE = tmp
             m.save_world()
@@ -604,21 +616,36 @@ class TestModelSaveLoad(unittest.TestCase):
         finally:
             os.unlink(tmp)
 
-    def test_save_format(self):
+    def test_save_writes_magic_header(self):
         m = self._make_model()
-        m.seed = 42
+        m.seed = 99
         m.add_block((1, 2, 3), config.STONE, immediate=False)
-        with tempfile.NamedTemporaryFile(suffix='.json', delete=False, mode='w') as f:
-            tmp = f.name
+        tmp = self._tmp_tcw()
         try:
             m.SAVE_FILE = tmp
             m.save_world()
-            with open(tmp) as f:
-                data = json.load(f)
-            self.assertEqual(data['seed'], 42)
-            self.assertEqual(len(data['blocks']), 1)
-            self.assertEqual(data['blocks'][0]['pos'], [1, 2, 3])
-            self.assertEqual(data['blocks'][0]['tex'], 'STONE')
+            with open(tmp, 'rb') as f:
+                magic = f.read(4)
+            self.assertEqual(magic, config.SAVE_MAGIC)
+        finally:
+            os.unlink(tmp)
+
+    def test_save_header_contains_seed_and_count(self):
+        import struct
+        from model import _HEADER_FMT
+        m = self._make_model()
+        m.seed = 42
+        m.add_block((1, 2, 3), config.STONE, immediate=False)
+        m.add_block((4, 5, 6), config.GRASS, immediate=False)
+        tmp = self._tmp_tcw()
+        try:
+            m.SAVE_FILE = tmp
+            m.save_world()
+            with open(tmp, 'rb') as f:
+                magic, ver, seed, count = _HEADER_FMT.unpack(f.read(_HEADER_FMT.size))
+            self.assertEqual(seed, 42)
+            self.assertEqual(count, 2)
+            self.assertEqual(ver, config.SAVE_VERSION)
         finally:
             os.unlink(tmp)
 
@@ -626,8 +653,7 @@ class TestModelSaveLoad(unittest.TestCase):
         m = self._make_model()
         for i in range(5):
             m.add_block((i, 0, 0), config.GRASS, immediate=False)
-        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
-            tmp = f.name
+        tmp = self._tmp_tcw()
         try:
             m.SAVE_FILE = tmp
             count = m.save_world()
@@ -635,22 +661,53 @@ class TestModelSaveLoad(unittest.TestCase):
         finally:
             os.unlink(tmp)
 
+    def test_save_block_data_correct(self):
+        import struct
+        from model import _HEADER_FMT, _BLOCK_FMT, _TEX_TO_BLOCK_ID
+        m = self._make_model()
+        m.seed = 1
+        m.add_block((10, 20, 30), config.DIRT, immediate=False)
+        tmp = self._tmp_tcw()
+        try:
+            m.SAVE_FILE = tmp
+            m.save_world()
+            with open(tmp, 'rb') as f:
+                f.read(_HEADER_FMT.size)
+                x, y, z, bid = _BLOCK_FMT.unpack(f.read(_BLOCK_FMT.size))
+            self.assertEqual((x, y, z), (10, 20, 30))
+            self.assertEqual(bid, _TEX_TO_BLOCK_ID[tuple(config.DIRT)])
+        finally:
+            os.unlink(tmp)
+
+    def test_file_size_is_correct(self):
+        from model import _HEADER_FMT, _BLOCK_FMT
+        m = self._make_model()
+        n = 7
+        for i in range(n):
+            m.add_block((i, 0, 0), config.STONE, immediate=False)
+        tmp = self._tmp_tcw()
+        try:
+            m.SAVE_FILE = tmp
+            m.save_world()
+            expected = _HEADER_FMT.size + n * _BLOCK_FMT.size
+            self.assertEqual(os.path.getsize(tmp), expected)
+        finally:
+            os.unlink(tmp)
+
+    # --- binary load ---
+
     def test_load_restores_blocks(self):
-        # Save a world then load it into a fresh model
         m1 = self._make_model()
         m1.seed = 7
         m1.add_block((3, 4, 5), config.WOOD, immediate=False)
         m1.add_block((6, 7, 8), config.LEAF, immediate=False)
-        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
-            tmp = f.name
+        tmp = self._tmp_tcw()
         try:
             m1.SAVE_FILE = tmp
             m1.save_world()
-
             m2 = self._make_model()
             m2.SAVE_FILE = tmp
             m2.load_world()
-
             self.assertIn((3, 4, 5), m2.world)
             self.assertIn((6, 7, 8), m2.world)
             self.assertEqual(m2.world[(3, 4, 5)], config.WOOD)
@@ -663,12 +720,10 @@ class TestModelSaveLoad(unittest.TestCase):
         m1 = self._make_model()
         for i in range(10):
             m1.add_block((i, 0, 0), config.GRASS, immediate=False)
-        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
-            tmp = f.name
+        tmp = self._tmp_tcw()
         try:
             m1.SAVE_FILE = tmp
             m1.save_world()
-
             m2 = self._make_model()
             m2.SAVE_FILE = tmp
             m2.load_world()
@@ -676,13 +731,39 @@ class TestModelSaveLoad(unittest.TestCase):
         finally:
             os.unlink(tmp)
 
+    def test_all_block_types_survive_roundtrip(self):
+        """Every block type encodes and decodes cleanly."""
+        blocks = [
+            config.GRASS, config.SAND, config.BRICK, config.STONE,
+            config.WOOD, config.LEAF, config.WATER, config.CRYSTAL,
+            config.MAGIC_WATER, config.DIRT, config.SNOW,
+            config.GLASS, config.PLANKS, config.GRAVEL,
+        ]
+        m1 = self._make_model()
+        m1.seed = 0
+        for i, tex in enumerate(blocks):
+            m1.add_block((i, 0, 0), tex, immediate=False)
+        tmp = self._tmp_tcw()
+        try:
+            m1.SAVE_FILE = tmp
+            m1.save_world()
+            m2 = self._make_model()
+            m2.SAVE_FILE = tmp
+            m2.load_world()
+            for i, tex in enumerate(blocks):
+                self.assertIn((i, 0, 0), m2.world)
+                self.assertEqual(m2.world[(i, 0, 0)], tex)
+        finally:
+            os.unlink(tmp)
+
+    # --- delete ---
+
     def test_delete_save(self):
         m = self._make_model()
-        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
-            tmp = f.name
+        tmp = self._tmp_tcw()
         try:
             m.SAVE_FILE = tmp
-            m.add_block((0,0,0), config.GRASS, immediate=False)
+            m.add_block((0, 0, 0), config.GRASS, immediate=False)
             m.save_world()
             self.assertTrue(os.path.exists(tmp))
             m.delete_save()
@@ -693,8 +774,112 @@ class TestModelSaveLoad(unittest.TestCase):
 
     def test_delete_save_no_file_no_error(self):
         m = self._make_model()
-        m.SAVE_FILE = '/tmp/timecraft_nonexistent_12345.json'
-        m.delete_save()  # should not raise
+        m.SAVE_FILE = '/tmp/timecraft_nonexistent_12345.tcw'
+        m.SAVE_FILE_LEGACY = '/tmp/timecraft_nonexistent_12345.json'
+        m.delete_save()   # should not raise
+
+    # --- migration: JSON → binary ---
+
+    def test_legacy_json_loads_correctly(self):
+        """_load_json_legacy reads an old-format JSON save."""
+        m1 = self._make_model()
+        m1.seed = 55
+        m1.add_block((1, 1, 1), config.BRICK, immediate=False)
+        # Write a proper legacy JSON file manually
+        legacy_data = {
+            'seed': 55,
+            'blocks': [{'pos': [1, 1, 1], 'tex': 'BRICK'}]
+        }
+        tmp_json = self._tmp_json()
+        try:
+            with open(tmp_json, 'w') as f:
+                json.dump(legacy_data, f)
+            m2 = self._make_model()
+            m2.SAVE_FILE = '/tmp/nonexistent_tcw_12345.tcw'
+            m2.SAVE_FILE_LEGACY = tmp_json
+            m2._load_json_legacy(tmp_json)
+            self.assertIn((1, 1, 1), m2.world)
+            self.assertEqual(m2.world[(1, 1, 1)], config.BRICK)
+            self.assertEqual(m2.seed, 55)
+        finally:
+            os.unlink(tmp_json)
+
+    def test_legacy_json_triggers_migration(self):
+        """Loading a JSON save produces a .tcw binary alongside it."""
+        legacy_data = {
+            'seed': 77,
+            'blocks': [{'pos': [5, 5, 5], 'tex': 'SNOW'}]
+        }
+        tmp_json = self._tmp_json()
+        tmp_tcw  = tmp_json.replace('.json', '.tcw')
+        try:
+            with open(tmp_json, 'w') as f:
+                json.dump(legacy_data, f)
+            m = self._make_model()
+            m.SAVE_FILE        = tmp_tcw
+            m.SAVE_FILE_LEGACY = tmp_json
+            m.load_world()
+            # Migration should have written the binary file
+            self.assertTrue(os.path.exists(tmp_tcw))
+            with open(tmp_tcw, 'rb') as f:
+                magic = f.read(4)
+            self.assertEqual(magic, config.SAVE_MAGIC)
+        finally:
+            for p in (tmp_json, tmp_tcw):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+
+class TestBinarySaveConfig(unittest.TestCase):
+    """Verify binary save config constants are correct."""
+
+    def test_save_magic_is_four_bytes(self):
+        self.assertEqual(len(config.SAVE_MAGIC), 4)
+
+    def test_save_magic_value(self):
+        self.assertEqual(config.SAVE_MAGIC, b'TCWF')
+
+    def test_save_version_positive(self):
+        self.assertGreater(config.SAVE_VERSION, 0)
+
+    def test_block_ids_has_14_entries(self):
+        self.assertEqual(len(config.BLOCK_IDS), 14)
+
+    def test_block_ids_are_all_strings(self):
+        for bid in config.BLOCK_IDS:
+            self.assertIsInstance(bid, str)
+
+    def test_block_ids_no_duplicates(self):
+        self.assertEqual(len(config.BLOCK_IDS), len(set(config.BLOCK_IDS)))
+
+    def test_block_ids_match_texture_names(self):
+        from model import _TEXTURE_NAMES
+        for name in config.BLOCK_IDS:
+            self.assertIn(name, _TEXTURE_NAMES,
+                          f"BLOCK_IDS entry '{name}' not in _TEXTURE_NAMES")
+
+    def test_block_id_to_tex_has_14_entries(self):
+        from model import _BLOCK_ID_TO_TEX
+        self.assertEqual(len(_BLOCK_ID_TO_TEX), 14)
+
+    def test_tex_to_block_id_has_14_entries(self):
+        from model import _TEX_TO_BLOCK_ID
+        self.assertEqual(len(_TEX_TO_BLOCK_ID), 14)
+
+    def test_block_id_roundtrip(self):
+        from model import _BLOCK_ID_TO_TEX, _TEX_TO_BLOCK_ID
+        for bid, tex in _BLOCK_ID_TO_TEX.items():
+            self.assertEqual(_TEX_TO_BLOCK_ID[tuple(tex)], bid)
+
+    def test_header_struct_size(self):
+        from model import _HEADER_FMT
+        self.assertEqual(_HEADER_FMT.size, 13)
+
+    def test_block_struct_size(self):
+        from model import _BLOCK_FMT
+        self.assertEqual(_BLOCK_FMT.size, 7)
+
+
 
 
 class TestModelSpawnPoint(unittest.TestCase):
@@ -803,7 +988,7 @@ class TestNewBlocks(unittest.TestCase):
         m1.add_block((2, 0, 0), config.GLASS, immediate=False)
         m1.add_block((3, 0, 0), config.PLANKS, immediate=False)
         m1.add_block((4, 0, 0), config.GRAVEL, immediate=False)
-        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix='.tcw', delete=False) as f:
             tmp = f.name
         try:
             m1.SAVE_FILE = tmp

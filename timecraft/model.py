@@ -4,6 +4,7 @@ import random
 import time
 import json
 import os
+import struct
 from collections import deque
 from dataclasses import dataclass
 from typing import Tuple
@@ -71,6 +72,19 @@ _TEXTURE_NAMES = {
     'GLASS': config.GLASS, 'PLANKS': config.PLANKS, 'GRAVEL': config.GRAVEL,
 }
 _TEXTURE_LOOKUP = {tuple(v): k for k, v in _TEXTURE_NAMES.items()}
+
+# Binary save: stable int → texture and texture → int mappings.
+# Derived from config.BLOCK_IDS so the canonical order lives in one place.
+_BLOCK_ID_TO_TEX = {i: _TEXTURE_NAMES[name]
+                    for i, name in enumerate(config.BLOCK_IDS)
+                    if name in _TEXTURE_NAMES}
+_TEX_TO_BLOCK_ID = {tuple(tex): i for i, tex in _BLOCK_ID_TO_TEX.items()}
+
+# Struct formats (little-endian)
+#   Header: magic(4s) + version(B) + seed(i) + block_count(I)  = 13 bytes
+#   Block:  x(h) + y(h) + z(h) + block_id(B)                  =  7 bytes
+_HEADER_FMT = struct.Struct('<4sBiI')
+_BLOCK_FMT  = struct.Struct('<hhhB')
 
 
 def _make_default_shader():
@@ -147,7 +161,8 @@ class TextureBindGroup(pyglet.graphics.Group):
 class Model(object):
 
     WORLD_SIZE = 128
-    SAVE_FILE = os.path.join(os.path.dirname(__file__), 'world_save.json')
+    SAVE_FILE  = os.path.join(os.path.dirname(__file__), 'world_save.tcw')
+    SAVE_FILE_LEGACY = os.path.join(os.path.dirname(__file__), 'world_save.json')
 
     def __init__(self):
         self.batch = pyglet.graphics.Batch()
@@ -177,9 +192,15 @@ class Model(object):
     # ------------------------------------------------------------------
 
     def _initialize(self):
-        """Load existing world or generate a fresh one."""
+        """Load existing world or generate a fresh one.
+
+        Checks for a binary save (.tcw) first, then falls back to the
+        legacy JSON save for one-time migration of existing worlds.
+        """
         if os.path.exists(self.SAVE_FILE):
             self.load_world()
+        elif os.path.exists(self.SAVE_FILE_LEGACY):
+            self.load_world()   # load_world detects format automatically
         else:
             self._generate_world()
 
@@ -265,24 +286,65 @@ class Model(object):
     # ------------------------------------------------------------------
 
     def save_world(self):
-        """Serialise world dict to JSON."""
-        data = {
-            'seed': self.seed,
-            'blocks': [
-                {
-                    'pos': list(pos),
-                    'tex': _TEXTURE_LOOKUP.get(tuple(tex), 'STONE')
-                }
-                for pos, tex in self.world.items()
-            ]
-        }
-        with open(self.SAVE_FILE, 'w') as f:
-            json.dump(data, f, separators=(',', ':'))
-        return len(data['blocks'])
+        """Serialise world to a binary .tcw file.
+
+        Format (little-endian):
+          Header — magic(4s) version(B) seed(i) block_count(I)  [13 bytes]
+          Blocks — x(h) y(h) z(h) block_id(B) per block         [7 bytes each]
+
+        Returns the number of blocks written.
+        """
+        blocks = [
+            (pos, _TEX_TO_BLOCK_ID.get(tuple(tex)))
+            for pos, tex in self.world.items()
+        ]
+        blocks = [(pos, bid) for pos, bid in blocks if bid is not None]
+
+        with open(self.SAVE_FILE, 'wb') as f:
+            f.write(_HEADER_FMT.pack(
+                config.SAVE_MAGIC,
+                config.SAVE_VERSION,
+                self.seed if self.seed is not None else 0,
+                len(blocks),
+            ))
+            for (x, y, z), bid in blocks:
+                f.write(_BLOCK_FMT.pack(x, y, z, bid))
+
+        return len(blocks)
 
     def load_world(self):
-        """Deserialise world dict from JSON."""
-        with open(self.SAVE_FILE, 'r') as f:
+        """Load a world from disk, auto-detecting binary (.tcw) or legacy JSON.
+
+        Binary is tried first via magic-byte check; JSON is the fallback for
+        one-time migration of pre-v0.8 saves.  After a successful JSON load
+        the world is immediately re-saved in binary format.
+        """
+        path = self.SAVE_FILE if os.path.exists(self.SAVE_FILE) else self.SAVE_FILE_LEGACY
+
+        with open(path, 'rb') as f:
+            magic = f.read(4)
+
+        if magic == config.SAVE_MAGIC:
+            self._load_binary(path)
+        else:
+            self._load_json_legacy(path)
+            self.save_world()   # migrate to binary on first load
+
+    def _load_binary(self, path):
+        """Read a .tcw binary save file."""
+        with open(path, 'rb') as f:
+            magic, version, seed, count = _HEADER_FMT.unpack(
+                f.read(_HEADER_FMT.size))
+            self.seed = seed
+            block_size = _BLOCK_FMT.size
+            for _ in range(count):
+                x, y, z, bid = _BLOCK_FMT.unpack(f.read(block_size))
+                tex = _BLOCK_ID_TO_TEX.get(bid, config.STONE)
+                self.add_block((x, y, z), tex, immediate=False)
+
+    def _load_json_legacy(self, path):
+        """Read a legacy JSON save (pre-v0.8).  Used for one-time migration."""
+        with open(path, 'r') as f:
             data = json.load(f)
         self.seed = data.get('seed')
         for entry in data['blocks']:
@@ -291,9 +353,10 @@ class Model(object):
             self.add_block(pos, tex, immediate=False)
 
     def delete_save(self):
-        """Remove save file so next launch regenerates the world."""
-        if os.path.exists(self.SAVE_FILE):
-            os.remove(self.SAVE_FILE)
+        """Remove save file(s) so next launch regenerates the world."""
+        for path in (self.SAVE_FILE, self.SAVE_FILE_LEGACY):
+            if os.path.exists(path):
+                os.remove(path)
 
     # ------------------------------------------------------------------
     # Core world logic (unchanged)

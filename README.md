@@ -1,4 +1,4 @@
-# 🌍 TimeCraft v0.7
+# 🌍 TimeCraft v0.8
 
 A 3D voxel sandbox engine built in Python with **pyglet** and **OpenGL 3.3 core** — procedurally generated worlds, custom GLSL shaders, real physics, ambient occlusion, a day/night cycle, and a working save/load system.
 
@@ -135,7 +135,7 @@ pytest
 
 ## 🧪 Tests
 
-221 tests, all passing. Run with:
+239 tests, all passing. Run with:
 ```bat
 test.bat
 ```
@@ -180,4 +180,4 @@ Personal project — unlicensed. Do whatever you like with it.
 
 ## 🏷️ Status
 
-**Active** — v0.7, 221 tests passing, fully playable.
+**Active** — v0.8, 239 tests passing, fully playable.

@@ -233,7 +233,7 @@ class Window(pyglet.window.Window):
         if symbol == key.W: self.strafe[0] += 1
         elif symbol == key.S: self.strafe[0] -= 1
         elif symbol == key.A: self.strafe[1] += 1
-        elif symbol == key.D: self.strafe[1] += 1
+        elif symbol == key.D: self.strafe[1] -= 1
         elif symbol == key.SPACE: self.jumping = False
         elif symbol == key.LSHIFT: self.crouch = False
         elif symbol == key.C: self.fov_offset += 60.0
