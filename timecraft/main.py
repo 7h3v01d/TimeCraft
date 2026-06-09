@@ -7,7 +7,6 @@ from window import Window
 
 def setup():
     """ Basic OpenGL configuration. """
-    gl.glClearColor(0.5, 0.69, 1.0, 1)
     gl.glEnable(gl.GL_CULL_FACE)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)

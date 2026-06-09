@@ -5,6 +5,8 @@ import time
 import json
 import os
 from collections import deque
+from dataclasses import dataclass
+from typing import Tuple
 import math
 
 import pyglet
@@ -13,7 +15,44 @@ from pyglet import image
 
 import config
 from noise_gen import NoiseGen
-from util import sectorize, cube_vertices, normalize
+
+
+@dataclass
+class Particle:
+    """A single short-lived block-break particle.
+
+    Position and velocity are in world space.  Rendering is handled by
+    Window.draw_particles() which projects the world position through the
+    current view/projection matrices and draws a coloured square on the
+    2-D HUD pass.
+    """
+    x: float
+    y: float
+    z: float
+    vx: float
+    vy: float
+    vz: float
+    colour: Tuple[int, int, int, int]
+    lifetime: float = config.PARTICLE_LIFETIME
+    age: float = 0.0
+
+    @property
+    def alive(self) -> bool:
+        return self.age < self.lifetime
+
+    @property
+    def alpha_fraction(self) -> float:
+        """0.0 (just spawned) → 1.0 (about to die); used to fade out."""
+        return self.age / self.lifetime
+
+    def update(self, dt: float) -> None:
+        self.vy -= config.PARTICLE_GRAVITY * dt
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        self.z += self.vz * dt
+        self.age += dt
+from util import sectorize, cube_vertices, normalize, compute_ao, \
+                  extract_frustum_planes, aabb_outside_frustum, sector_aabb
 
 # Indices to convert 6 quads (each 4 verts) into triangles
 # Each face: verts 0,1,2 and 0,2,3
@@ -39,21 +78,27 @@ def _make_default_shader():
 #version 330 core
 in vec3 position;
 in vec2 tex_coords;
+in float ao;
 out vec2 v_texcoord;
+out float v_ao;
 uniform mat4 view;
 uniform mat4 projection;
 void main() {
     gl_Position = projection * view * vec4(position, 1.0);
     v_texcoord = tex_coords;
+    v_ao = ao;
 }
 """
     frag_src = """
 #version 330 core
 in vec2 v_texcoord;
+in float v_ao;
 out vec4 out_color;
 uniform sampler2D our_texture;
+uniform float sun_brightness;
 void main() {
-    out_color = texture(our_texture, v_texcoord);
+    vec4 tex = texture(our_texture, v_texcoord);
+    out_color = vec4(tex.rgb * v_ao * sun_brightness, tex.a);
 }
 """
     return pyglet.graphics.shader.ShaderProgram(
@@ -122,8 +167,9 @@ class Model(object):
         self.sectors = {}
         self.queue = deque()
         self.particles = []
-        self.game_time = 0
+        self.game_time = config.DAY_LENGTH / 4.0  # start at noon
         self.seed = None  # set by _initialize or load_world
+        self.frustum_planes = None  # set each frame by set_frustum()
         self._initialize()
 
     # ------------------------------------------------------------------
@@ -284,6 +330,7 @@ class Model(object):
             self.check_neighbors(position)
 
     def remove_block(self, position, immediate=True, hit_vector=None):
+        self.spawn_particles(position)   # must come before del so texture is still in world
         del self.world[position]
         self.sectors[sectorize(position, config.SECTOR_SIZE)].remove(position)
         if immediate:
@@ -316,17 +363,27 @@ class Model(object):
         x, y, z = position
         vertex_data = cube_vertices(x, y, z, 0.5)
         texture_data = list(texture)
+        ao_data = compute_ao(position, self.world)
 
         is_water = (texture == config.WATER or texture == config.MAGIC_WATER)
         group = self.water_group if is_water else self.group
         shader = self.water_shader if is_water else self.default_shader
 
-        vlist = shader.vertex_list_indexed(
-            24, gl.GL_TRIANGLES, QUAD_INDICES,
-            self.batch, group,
-            position=('f', vertex_data),
-            tex_coords=('f', texture_data),
-        )
+        if is_water:
+            vlist = shader.vertex_list_indexed(
+                24, gl.GL_TRIANGLES, QUAD_INDICES,
+                self.batch, group,
+                position=('f', vertex_data),
+                tex_coords=('f', texture_data),
+            )
+        else:
+            vlist = shader.vertex_list_indexed(
+                24, gl.GL_TRIANGLES, QUAD_INDICES,
+                self.batch, group,
+                position=('f', vertex_data),
+                tex_coords=('f', texture_data),
+                ao=('f', ao_data),
+            )
         self._shown[position] = vlist
 
     def hide_block(self, position, immediate=True):
@@ -341,6 +398,13 @@ class Model(object):
             self._shown.pop(position).delete()
 
     def show_sector(self, sector):
+        """Show all exposed blocks in *sector*, skipping sectors outside the frustum."""
+        if self.frustum_planes is not None:
+            mn_x, mn_y, mn_z, mx_x, mx_y, mx_z = sector_aabb(sector)
+            if aabb_outside_frustum(self.frustum_planes,
+                                    mn_x, mn_y, mn_z,
+                                    mx_x, mx_y, mx_z):
+                return
         for position in self.sectors.get(sector, []):
             if position not in self.shown and self.exposed(position):
                 self.show_block(position, False)
@@ -349,6 +413,13 @@ class Model(object):
         for position in self.sectors.get(sector, []):
             if position in self.shown:
                 self.hide_block(position, False)
+
+    def set_frustum(self, vp_matrix):
+        """Update the stored frustum planes from the current view-projection matrix.
+
+        Called once per frame from Window.on_draw() before change_sectors runs.
+        """
+        self.frustum_planes = extract_frustum_planes(vp_matrix)
 
     def change_sectors(self, before, after):
         before_set = set()
@@ -388,16 +459,59 @@ class Model(object):
         while self.queue:
             self._dequeue()
 
+    # ------------------------------------------------------------------
+    # Particle system
+    # ------------------------------------------------------------------
+
+    def spawn_particles(self, position):
+        """Spawn a burst of particles at *position* coloured to match the block.
+
+        Called by remove_block when a block is broken by the player.
+        Does nothing if the block texture has no mapped particle colour.
+        """
+        tex = self.world.get(position)
+        if tex is None:
+            return
+        colour = config.TEXTURE_PARTICLE_MAP.get(tuple(tex))
+        if colour is None:
+            return
+
+        x, y, z = position
+        for _ in range(config.PARTICLE_COUNT):
+            speed = config.PARTICLE_SPEED
+            vx = random.uniform(-speed, speed)
+            vy = random.uniform(0.5 * speed, speed)   # bias upward
+            vz = random.uniform(-speed, speed)
+            # Spawn at a random sub-block offset so they don't all stack
+            ox = random.uniform(-0.3, 0.3)
+            oy = random.uniform(0.0, 0.5)
+            oz = random.uniform(-0.3, 0.3)
+            self.particles.append(
+                Particle(x + ox, y + oy, z + oz, vx, vy, vz, colour)
+            )
+
+    def update_particles(self, dt):
+        """Advance all particles and discard dead ones.  Call once per frame."""
+        live = []
+        for p in self.particles:
+            p.update(dt)
+            if p.alive:
+                live.append(p)
+        self.particles = live
+
     def set_shader_uniforms(self, view_matrix, proj_matrix):
-        """Called each frame to push view/projection into both shaders."""
+        """Called each frame to push view/projection and day/night uniforms into both shaders."""
         view_flat = list(view_matrix)
         proj_flat = list(proj_matrix)
+        brightness = config.sun_brightness(self.game_time)
         self.default_shader.use()
         self.default_shader['view'] = view_flat
         self.default_shader['projection'] = proj_flat
+        self.default_shader['sun_brightness'] = brightness
         self.default_shader.stop()
         self.water_shader.use()
         self.water_shader['view'] = view_flat
         self.water_shader['projection'] = proj_flat
         self.water_shader['time'] = self.game_time
+        self.water_shader['sun_brightness'] = brightness
         self.water_shader.stop()

@@ -58,9 +58,33 @@ def _make_pyglet_stub():
     fake_tex = MagicMock()
     fake_tex.target = 0
     fake_tex.id = 1
+    fake_region = MagicMock()
+    fake_grid = MagicMock()
+    fake_grid.__getitem__ = MagicMock(return_value=fake_region)
     image_mod.load = MagicMock(return_value=MagicMock(get_texture=MagicMock(return_value=fake_tex)))
     image_mod.create = MagicMock()
     image_mod.SolidColorImagePattern = MagicMock()
+    image_mod.ImageGrid = MagicMock(return_value=fake_grid)
+    image_mod.TextureGrid = MagicMock(return_value=fake_grid)
+
+    # pyglet.sprite
+    sprite_mod = types.ModuleType("pyglet.sprite")
+    class _FakeSprite:
+        def __init__(self, img, x=0, y=0, batch=None):
+            self.x = x
+            self.y = y
+            self.width = 0
+            self.height = 0
+    sprite_mod.Sprite = _FakeSprite
+
+    # pyglet.shapes (extend existing or create)
+    shapes_mod = types.ModuleType("pyglet.shapes")
+    class _FakeRect:
+        def __init__(self, x, y, w, h, color=(255,255,255,255), batch=None): pass
+    class _FakeLine:
+        def __init__(self, x1, y1, x2, y2, thickness=1, color=(0,0,0,255), batch=None): pass
+    shapes_mod.Rectangle = _FakeRect
+    shapes_mod.Line = _FakeLine
 
     # pyglet.clock / app
     clock_mod = types.ModuleType("pyglet.clock")
@@ -70,6 +94,8 @@ def _make_pyglet_stub():
     pyglet.graphics = graphics
     pyglet.gl = gl
     pyglet.image = image_mod
+    pyglet.sprite = sprite_mod
+    pyglet.shapes = shapes_mod
     pyglet.clock = clock_mod
     pyglet.app = app_mod
 
@@ -79,6 +105,8 @@ def _make_pyglet_stub():
     sys.modules["pyglet.gl"] = gl
     sys.modules["pyglet.gl.gl"] = gl
     sys.modules["pyglet.image"] = image_mod
+    sys.modules["pyglet.sprite"] = sprite_mod
+    sys.modules["pyglet.shapes"] = shapes_mod
     sys.modules["pyglet.clock"] = clock_mod
     sys.modules["pyglet.app"] = app_mod
 
@@ -91,9 +119,10 @@ sys.path.insert(0, "timecraft")  # or from parent
 import config
 import tempfile
 import json
-from util import cube_vertices, normalize, sectorize
+from util import cube_vertices, normalize, sectorize, compute_ao, \
+                  extract_frustum_planes, aabb_outside_frustum, sector_aabb
 from noise_gen import NoiseGen, NoiseParameters
-from model import Model, QUAD_INDICES
+from model import Model, QUAD_INDICES, Particle
 
 
 # ===========================================================================
@@ -799,3 +828,876 @@ class TestNewBlocks(unittest.TestCase):
                       config.DIRT, config.PLANKS, config.GRAVEL, config.SNOW, config.GLASS]
         tuples = [tuple(b) for b in all_blocks]
         self.assertEqual(len(set(tuples)), len(all_blocks), "Inventory has duplicate block types")
+
+
+# ===========================================================================
+# Particle system
+# ===========================================================================
+
+class TestParticle(unittest.TestCase):
+    """Unit tests for the Particle dataclass."""
+
+    def _make(self, **kwargs):
+        defaults = dict(x=0.0, y=0.0, z=0.0, vx=1.0, vy=2.0, vz=0.0,
+                        colour=(100, 100, 100, 255))
+        defaults.update(kwargs)
+        return Particle(**defaults)
+
+    def test_alive_at_birth(self):
+        p = self._make()
+        self.assertTrue(p.alive)
+
+    def test_dead_after_full_lifetime(self):
+        p = self._make()
+        p.age = p.lifetime
+        self.assertFalse(p.alive)
+
+    def test_alpha_fraction_zero_at_birth(self):
+        p = self._make()
+        self.assertAlmostEqual(p.alpha_fraction, 0.0)
+
+    def test_alpha_fraction_one_at_death(self):
+        p = self._make()
+        p.age = p.lifetime
+        self.assertAlmostEqual(p.alpha_fraction, 1.0)
+
+    def test_update_advances_age(self):
+        p = self._make()
+        p.update(0.1)
+        self.assertAlmostEqual(p.age, 0.1)
+
+    def test_update_moves_position(self):
+        p = self._make(x=0.0, y=10.0, z=0.0, vx=1.0, vy=0.0, vz=2.0)
+        p.update(1.0)
+        self.assertAlmostEqual(p.x, 1.0)
+        self.assertAlmostEqual(p.z, 2.0)
+
+    def test_gravity_pulls_down(self):
+        p = self._make(vy=0.0)
+        p.update(1.0)
+        self.assertLess(p.vy, 0.0)
+
+    def test_upward_velocity_decelerates(self):
+        p = self._make(vy=10.0)
+        initial_vy = p.vy
+        p.update(0.5)
+        self.assertLess(p.vy, initial_vy)
+
+    def test_custom_lifetime(self):
+        p = self._make(lifetime=2.0)
+        p.update(1.9)
+        self.assertTrue(p.alive)
+        p.update(0.2)
+        self.assertFalse(p.alive)
+
+    def test_colour_stored_correctly(self):
+        colour = (200, 100, 50, 180)
+        p = self._make(colour=colour)
+        self.assertEqual(p.colour, colour)
+
+
+class TestParticleConfig(unittest.TestCase):
+    """Verify particle config constants are sane."""
+
+    def test_particle_count_positive(self):
+        self.assertGreater(config.PARTICLE_COUNT, 0)
+
+    def test_particle_lifetime_positive(self):
+        self.assertGreater(config.PARTICLE_LIFETIME, 0.0)
+
+    def test_particle_size_positive(self):
+        self.assertGreater(config.PARTICLE_SIZE, 0)
+
+    def test_particle_speed_positive(self):
+        self.assertGreater(config.PARTICLE_SPEED, 0.0)
+
+    def test_particle_gravity_positive(self):
+        self.assertGreater(config.PARTICLE_GRAVITY, 0.0)
+
+    def test_all_block_types_in_particle_map(self):
+        block_types = [
+            config.GRASS, config.SAND, config.BRICK, config.STONE,
+            config.WOOD, config.LEAF, config.WATER, config.CRYSTAL,
+            config.MAGIC_WATER, config.DIRT, config.SNOW,
+            config.GLASS, config.PLANKS, config.GRAVEL,
+        ]
+        for block in block_types:
+            key = tuple(block)
+            self.assertIn(key, config.TEXTURE_PARTICLE_MAP,
+                          f"Block texture not in TEXTURE_PARTICLE_MAP")
+
+    def test_particle_colours_are_rgba_tuples(self):
+        for key, colour in config.TEXTURE_PARTICLE_MAP.items():
+            self.assertIsInstance(colour, tuple)
+            self.assertEqual(len(colour), 4)
+            for channel in colour:
+                self.assertGreaterEqual(channel, 0)
+                self.assertLessEqual(channel, 255)
+
+    def test_particle_map_has_correct_entry_count(self):
+        self.assertEqual(len(config.TEXTURE_PARTICLE_MAP), 14)
+
+
+class TestModelParticles(unittest.TestCase):
+    """Test spawn_particles and update_particles on a headless Model."""
+
+    def setUp(self):
+        with patch.object(Model, '_initialize', return_value=None):
+            self.model = Model()
+
+    def test_particles_list_starts_empty(self):
+        self.assertEqual(self.model.particles, [])
+
+    def test_spawn_adds_particles(self):
+        self.model.add_block((5, 5, 5), config.GRASS, immediate=False)
+        self.model.spawn_particles((5, 5, 5))
+        self.assertEqual(len(self.model.particles), config.PARTICLE_COUNT)
+
+    def test_spawn_correct_count(self):
+        self.model.add_block((0, 0, 0), config.STONE, immediate=False)
+        self.model.spawn_particles((0, 0, 0))
+        self.assertEqual(len(self.model.particles), config.PARTICLE_COUNT)
+
+    def test_spawn_near_block_position(self):
+        self.model.add_block((10, 20, 30), config.DIRT, immediate=False)
+        self.model.spawn_particles((10, 20, 30))
+        for p in self.model.particles:
+            self.assertAlmostEqual(p.x, 10.0, delta=1.0)
+            self.assertAlmostEqual(p.y, 20.0, delta=1.5)
+            self.assertAlmostEqual(p.z, 30.0, delta=1.0)
+
+    def test_spawn_uses_block_colour(self):
+        self.model.add_block((0, 0, 0), config.CRYSTAL, immediate=False)
+        self.model.spawn_particles((0, 0, 0))
+        expected = config.TEXTURE_PARTICLE_MAP[tuple(config.CRYSTAL)]
+        for p in self.model.particles:
+            self.assertEqual(p.colour, expected)
+
+    def test_spawn_on_missing_position_is_noop(self):
+        # Position not in world — should not crash or add particles
+        self.model.spawn_particles((99, 99, 99))
+        self.assertEqual(self.model.particles, [])
+
+    def test_update_particles_advances_age(self):
+        self.model.add_block((0, 0, 0), config.GRASS, immediate=False)
+        self.model.spawn_particles((0, 0, 0))
+        self.model.update_particles(0.1)
+        for p in self.model.particles:
+            self.assertAlmostEqual(p.age, 0.1, places=5)
+
+    def test_update_particles_removes_dead(self):
+        self.model.add_block((0, 0, 0), config.WOOD, immediate=False)
+        self.model.spawn_particles((0, 0, 0))
+        # Age them past their lifetime
+        self.model.update_particles(config.PARTICLE_LIFETIME + 1.0)
+        self.assertEqual(self.model.particles, [])
+
+    def test_update_particles_keeps_live_ones(self):
+        self.model.add_block((0, 0, 0), config.SAND, immediate=False)
+        self.model.spawn_particles((0, 0, 0))
+        self.model.update_particles(config.PARTICLE_LIFETIME * 0.1)
+        self.assertEqual(len(self.model.particles), config.PARTICLE_COUNT)
+
+    def test_remove_block_triggers_spawn(self):
+        self.model.add_block((3, 3, 3), config.GRASS, immediate=False)
+        self.model.remove_block((3, 3, 3), immediate=False)
+        self.assertEqual(len(self.model.particles), config.PARTICLE_COUNT)
+
+    def test_multiple_spawns_accumulate(self):
+        for pos in [(0, 0, 0), (1, 0, 0), (2, 0, 0)]:
+            self.model.add_block(pos, config.STONE, immediate=False)
+            self.model.spawn_particles(pos)
+        self.assertEqual(len(self.model.particles), config.PARTICLE_COUNT * 3)
+
+    def test_particles_have_upward_bias(self):
+        self.model.add_block((0, 0, 0), config.GRAVEL, immediate=False)
+        self.model.spawn_particles((0, 0, 0))
+        avg_vy = sum(p.vy for p in self.model.particles) / len(self.model.particles)
+        self.assertGreater(avg_vy, 0.0, "Particles should have net upward velocity on spawn")
+
+    def test_snow_block_gets_snow_colour(self):
+        self.model.add_block((0, 0, 0), config.SNOW, immediate=False)
+        self.model.spawn_particles((0, 0, 0))
+        expected = config.PARTICLE_SNOW
+        for p in self.model.particles:
+            self.assertEqual(p.colour, expected)
+
+    def test_glass_block_gets_glass_colour(self):
+        self.model.add_block((0, 0, 0), config.GLASS, immediate=False)
+        self.model.spawn_particles((0, 0, 0))
+        expected = config.PARTICLE_GLASS
+        for p in self.model.particles:
+            self.assertEqual(p.colour, expected)
+
+
+# ===========================================================================
+# Ambient occlusion
+# ===========================================================================
+
+class TestAOConfig(unittest.TestCase):
+    """Verify AO constants are well-formed."""
+
+    def test_face_base_has_six_entries(self):
+        self.assertEqual(len(config.AO_FACE_BASE), 6)
+
+    def test_face_base_values_in_range(self):
+        for v in config.AO_FACE_BASE:
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+
+    def test_top_face_is_brightest(self):
+        self.assertEqual(config.AO_FACE_BASE[0], max(config.AO_FACE_BASE))
+
+    def test_bottom_face_is_darkest(self):
+        self.assertEqual(config.AO_FACE_BASE[1], min(config.AO_FACE_BASE))
+
+    def test_ao_neighbours_has_24_entries(self):
+        self.assertEqual(len(config.AO_NEIGHBOURS), 24)
+
+    def test_each_neighbour_entry_has_three_offsets(self):
+        for entry in config.AO_NEIGHBOURS:
+            self.assertEqual(len(entry), 3)
+
+    def test_each_offset_is_integer_triple(self):
+        for entry in config.AO_NEIGHBOURS:
+            for offset in entry:
+                self.assertEqual(len(offset), 3)
+                for v in offset:
+                    self.assertIsInstance(v, int)
+
+    def test_ao_step_positive(self):
+        self.assertGreater(config.AO_STEP, 0.0)
+
+    def test_max_darkening_stays_above_zero(self):
+        # 3 neighbours × AO_STEP should not exceed the minimum face base
+        min_base = min(config.AO_FACE_BASE)
+        self.assertGreater(min_base - 3 * config.AO_STEP, -0.01,
+                           "AO_STEP too large: bottom face could go below zero")
+
+
+class TestComputeAO(unittest.TestCase):
+    """Unit tests for compute_ao() in util.py."""
+
+    def test_returns_24_values(self):
+        ao = compute_ao((0, 0, 0), {(0, 0, 0)})
+        self.assertEqual(len(ao), 24)
+
+    def test_all_values_floats(self):
+        ao = compute_ao((0, 0, 0), {(0, 0, 0)})
+        for v in ao:
+            self.assertIsInstance(v, float)
+
+    def test_values_in_range(self):
+        ao = compute_ao((0, 0, 0), {(0, 0, 0)})
+        for v in ao:
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+
+    def test_isolated_block_top_face_is_max(self):
+        ao = compute_ao((5, 5, 5), {(5, 5, 5)})
+        top_verts = ao[0:4]
+        for v in top_verts:
+            self.assertAlmostEqual(v, config.AO_FACE_BASE[0])
+
+    def test_isolated_block_bottom_face_is_min(self):
+        ao = compute_ao((5, 5, 5), {(5, 5, 5)})
+        bottom_verts = ao[4:8]
+        for v in bottom_verts:
+            self.assertAlmostEqual(v, config.AO_FACE_BASE[1])
+
+    def test_isolated_block_side_faces_correct(self):
+        ao = compute_ao((0, 0, 0), {(0, 0, 0)})
+        side_verts = ao[8:]   # faces 2–5, 16 values
+        for v in side_verts:
+            self.assertAlmostEqual(v, config.AO_FACE_BASE[2])
+
+    def test_neighbour_above_right_darkens_top_corner(self):
+        # (1,1,0) is above-right; top face verts v2 and v3 share the +x side
+        world = {(0,0,0), (1,1,0)}
+        ao = compute_ao((0, 0, 0), world)
+        top = ao[0:4]
+        # v2 (index 2) and v3 (index 3) should be darker than v0 and v1
+        self.assertLess(top[2], top[0])
+        self.assertLess(top[3], top[0])
+        self.assertAlmostEqual(top[0], config.AO_FACE_BASE[0])  # v0 unaffected
+        self.assertAlmostEqual(top[1], config.AO_FACE_BASE[0])  # v1 unaffected
+
+    def test_darkening_magnitude_one_neighbour(self):
+        world = {(0,0,0), (1,1,0)}
+        ao = compute_ao((0, 0, 0), world)
+        # v2 and v3 each have exactly 1 neighbour → base - 1*AO_STEP
+        expected = config.AO_FACE_BASE[0] - config.AO_STEP
+        self.assertAlmostEqual(ao[2], expected)
+        self.assertAlmostEqual(ao[3], expected)
+
+    def test_no_values_below_zero(self):
+        # Surround with many neighbours; no value should go negative
+        world = {(0,0,0)}
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                for dz in range(-1, 2):
+                    world.add((dx, dy, dz))
+        ao = compute_ao((0, 0, 0), world)
+        for v in ao:
+            self.assertGreaterEqual(v, 0.0)
+
+    def test_position_offset_works_correctly(self):
+        # Same relative geometry at different absolute positions
+        ao_origin = compute_ao((0, 0, 0), {(0, 0, 0), (1, 1, 0)})
+        ao_offset = compute_ao((10, 20, 30), {(10, 20, 30), (11, 21, 30)})
+        for a, b in zip(ao_origin, ao_offset):
+            self.assertAlmostEqual(a, b)
+
+    def test_symmetric_neighbours_produce_uniform_darkening(self):
+        # Block surrounded uniformly on one face axis: all 4 verts of that face darkened equally
+        world = {(0,0,0), (-1,1,0), (1,1,0), (0,1,-1), (0,1,1)}
+        ao = compute_ao((0, 0, 0), world)
+        top = ao[0:4]
+        # Each top vert has exactly 2 neighbours → base - 2*AO_STEP
+        expected = config.AO_FACE_BASE[0] - 2 * config.AO_STEP
+        for v in top:
+            self.assertAlmostEqual(v, expected)
+
+    def test_ao_neighbours_table_length(self):
+        self.assertEqual(len(config.AO_NEIGHBOURS), 24)
+
+    def test_world_without_block_itself(self):
+        # compute_ao should work even if the block isn't in the world dict
+        ao = compute_ao((0, 0, 0), set())
+        for v in ao:
+            self.assertGreaterEqual(v, 0.0)
+
+
+# ===========================================================================
+# Hotbar
+# ===========================================================================
+
+class TestHotbarConfig(unittest.TestCase):
+    """Verify hotbar config constants are sane."""
+
+    def test_slot_size_positive(self):
+        self.assertGreater(config.HOTBAR_SLOT_SIZE, 0)
+
+    def test_padding_non_negative(self):
+        self.assertGreaterEqual(config.HOTBAR_PADDING, 0)
+
+    def test_icon_pad_non_negative(self):
+        self.assertGreaterEqual(config.HOTBAR_ICON_PAD, 0)
+
+    def test_icon_fits_in_slot(self):
+        icon_size = config.HOTBAR_SLOT_SIZE - config.HOTBAR_ICON_PAD * 2
+        self.assertGreater(icon_size, 0)
+
+    def test_hotbar_y_non_negative(self):
+        self.assertGreaterEqual(config.HOTBAR_Y, 0)
+
+    def test_atlas_cell_map_has_14_entries(self):
+        self.assertEqual(len(config.TEXTURE_ATLAS_CELL), 14)
+
+    def test_all_inventory_blocks_in_atlas_map(self):
+        inventory = [
+            config.BRICK, config.GRASS, config.SAND, config.STONE,
+            config.WOOD, config.LEAF, config.CRYSTAL,
+            config.DIRT, config.PLANKS, config.GRAVEL, config.SNOW, config.GLASS,
+        ]
+        for block in inventory:
+            self.assertIn(tuple(block), config.TEXTURE_ATLAS_CELL,
+                          "Inventory block missing from TEXTURE_ATLAS_CELL")
+
+    def test_atlas_cells_are_valid_coords(self):
+        for tex_key, (col, row) in config.TEXTURE_ATLAS_CELL.items():
+            self.assertGreaterEqual(col, 0)
+            self.assertLess(col, 4, f"Atlas col {col} out of range for 4×4 grid")
+            self.assertGreaterEqual(row, 0)
+            self.assertLess(row, 4, f"Atlas row {row} out of range for 4×4 grid")
+
+    def test_atlas_cells_are_tuples_of_two_ints(self):
+        for tex_key, cell in config.TEXTURE_ATLAS_CELL.items():
+            self.assertIsInstance(cell, tuple)
+            self.assertEqual(len(cell), 2)
+            self.assertIsInstance(cell[0], int)
+            self.assertIsInstance(cell[1], int)
+
+    def test_no_duplicate_atlas_cells_in_inventory(self):
+        inventory = [
+            config.BRICK, config.GRASS, config.SAND, config.STONE,
+            config.WOOD, config.LEAF, config.CRYSTAL,
+            config.DIRT, config.PLANKS, config.GRAVEL, config.SNOW, config.GLASS,
+        ]
+        cells = [config.TEXTURE_ATLAS_CELL[tuple(b)] for b in inventory]
+        self.assertEqual(len(cells), len(set(cells)),
+                         "Two inventory blocks map to the same atlas cell")
+
+    def test_grass_top_face_cell(self):
+        # GRASS top face is atlas col=1, row=0
+        cell = config.TEXTURE_ATLAS_CELL[tuple(config.GRASS)]
+        self.assertEqual(cell, (1, 0))
+
+    def test_stone_cell(self):
+        cell = config.TEXTURE_ATLAS_CELL[tuple(config.STONE)]
+        self.assertEqual(cell, (2, 1))
+
+    def test_snow_top_face_cell(self):
+        # SNOW top face is atlas col=3, row=3
+        cell = config.TEXTURE_ATLAS_CELL[tuple(config.SNOW)]
+        self.assertEqual(cell, (3, 3))
+
+
+class TestHotbarInventory(unittest.TestCase):
+    """Test inventory data and selection logic (no GL required)."""
+
+    def _make_inventory(self):
+        return [
+            config.BRICK, config.GRASS, config.SAND, config.STONE,
+            config.WOOD, config.LEAF, config.CRYSTAL,
+            config.DIRT, config.PLANKS, config.GRAVEL, config.SNOW, config.GLASS,
+        ]
+
+    def test_inventory_has_12_slots(self):
+        inv = self._make_inventory()
+        self.assertEqual(len(inv), 12)
+
+    def test_all_slots_distinct(self):
+        inv = self._make_inventory()
+        as_tuples = [tuple(b) for b in inv]
+        self.assertEqual(len(set(as_tuples)), len(inv))
+
+    def test_scroll_forward_wraps(self):
+        inv = self._make_inventory()
+        current = 11   # last slot
+        next_slot = (current - 1) % len(inv)
+        self.assertEqual(next_slot, 10)
+
+    def test_scroll_backward_wraps(self):
+        inv = self._make_inventory()
+        current = 0
+        prev_slot = (current + 1) % len(inv)
+        self.assertEqual(prev_slot, 1)
+
+    def test_scroll_wraps_from_last_to_first(self):
+        inv = self._make_inventory()
+        current = len(inv) - 1
+        next_idx = (current - (-1)) % len(inv)   # scroll_y = -1 → scroll backward
+        self.assertEqual(next_idx, 0)
+
+    def test_num_key_index_calculation(self):
+        # Keys 1-9 map to indices 0-8, key 0 maps to index 9
+        # Formula: (symbol - num_keys[0]) % len(inventory)
+        # Simulate: num_keys = [k1, k2, ..., k0], symbols are sequential
+        num_keys = list(range(10))   # 0..9 stand-ins
+        inventory = list(range(12))
+        for i, sym in enumerate(num_keys):
+            idx = (sym - num_keys[0]) % len(inventory)
+            self.assertEqual(idx, i % len(inventory))
+
+    def test_hotbar_total_width_calculation(self):
+        n = 12
+        slot_size = config.HOTBAR_SLOT_SIZE
+        padding = config.HOTBAR_PADDING
+        total_w = n * slot_size + (n - 1) * padding
+        self.assertGreater(total_w, 0)
+        # Should fit within a 1280px window
+        self.assertLess(total_w, 1280)
+
+    def test_slot_x_positions_non_overlapping(self):
+        n = 12
+        slot_size = config.HOTBAR_SLOT_SIZE
+        padding = config.HOTBAR_PADDING
+        total_w = n * slot_size + (n - 1) * padding
+        start_x = (1280 - total_w) // 2
+        positions = [start_x + i * (slot_size + padding) for i in range(n)]
+        for i in range(len(positions) - 1):
+            self.assertGreaterEqual(positions[i + 1], positions[i] + slot_size,
+                                    f"Slots {i} and {i+1} overlap")
+
+
+# ===========================================================================
+# Day / night cycle
+# ===========================================================================
+
+class TestDayNightConfig(unittest.TestCase):
+    """Verify day/night config constants are sane."""
+
+    def test_day_length_positive(self):
+        self.assertGreater(config.DAY_LENGTH, 0.0)
+
+    def test_sun_min_brightness_in_range(self):
+        self.assertGreater(config.SUN_MIN_BRIGHTNESS, 0.0)
+        self.assertLess(config.SUN_MIN_BRIGHTNESS, 1.0)
+
+    def test_sky_colours_are_tuples_of_three(self):
+        for colour in [config.SKY_DAWN, config.SKY_DAY, config.SKY_DUSK, config.SKY_NIGHT]:
+            self.assertIsInstance(colour, tuple)
+            self.assertEqual(len(colour), 3)
+
+    def test_sky_colour_channels_in_range(self):
+        for colour in [config.SKY_DAWN, config.SKY_DAY, config.SKY_DUSK, config.SKY_NIGHT]:
+            for ch in colour:
+                self.assertGreaterEqual(ch, 0.0)
+                self.assertLessEqual(ch, 1.0)
+
+    def test_day_sky_is_bluest(self):
+        # Midday sky should have the highest blue channel
+        blues = [c[2] for c in [config.SKY_DAWN, config.SKY_DAY, config.SKY_DUSK, config.SKY_NIGHT]]
+        self.assertEqual(max(blues), config.SKY_DAY[2])
+
+    def test_night_sky_is_darkest(self):
+        avg = lambda c: sum(c) / 3
+        avgs = [avg(c) for c in [config.SKY_DAWN, config.SKY_DAY, config.SKY_DUSK, config.SKY_NIGHT]]
+        self.assertEqual(min(avgs), avg(config.SKY_NIGHT))
+
+
+class TestSunBrightness(unittest.TestCase):
+    """Unit tests for config.sun_brightness()."""
+
+    def test_noon_is_maximum(self):
+        # Noon = DAY_LENGTH / 4 (quarter day in)
+        noon = config.DAY_LENGTH / 4.0
+        self.assertAlmostEqual(config.sun_brightness(noon), 1.0, places=3)
+
+    def test_midnight_is_minimum(self):
+        # Midnight = 3/4 of a day in
+        midnight = config.DAY_LENGTH * 3.0 / 4.0
+        self.assertAlmostEqual(config.sun_brightness(midnight),
+                               config.SUN_MIN_BRIGHTNESS, places=3)
+
+    def test_always_at_least_min_brightness(self):
+        for i in range(100):
+            t = i * config.DAY_LENGTH / 100.0
+            self.assertGreaterEqual(config.sun_brightness(t), config.SUN_MIN_BRIGHTNESS)
+
+    def test_never_exceeds_one(self):
+        for i in range(100):
+            t = i * config.DAY_LENGTH / 100.0
+            self.assertLessEqual(config.sun_brightness(t), 1.0 + 1e-9)
+
+    def test_symmetric_around_noon(self):
+        # Dawn and dusk should be equal (symmetric sinusoid)
+        dawn = config.sun_brightness(0.0)
+        dusk = config.sun_brightness(config.DAY_LENGTH / 2.0)
+        self.assertAlmostEqual(dawn, dusk, places=5)
+
+    def test_morning_brighter_than_midnight(self):
+        morning = config.sun_brightness(config.DAY_LENGTH / 8.0)
+        midnight = config.sun_brightness(config.DAY_LENGTH * 3.0 / 4.0)
+        self.assertGreater(morning, midnight)
+
+    def test_wraps_correctly_over_multiple_days(self):
+        # Brightness at t and t + DAY_LENGTH should be equal
+        t = 123.45
+        self.assertAlmostEqual(
+            config.sun_brightness(t),
+            config.sun_brightness(t + config.DAY_LENGTH),
+            places=5
+        )
+
+    def test_returns_float(self):
+        self.assertIsInstance(config.sun_brightness(0.0), float)
+
+
+class TestSkyColour(unittest.TestCase):
+    """Unit tests for config.sky_colour()."""
+
+    def test_returns_tuple_of_three(self):
+        result = config.sky_colour(0.0)
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 3)
+
+    def test_channels_in_range(self):
+        for i in range(60):
+            t = i * config.DAY_LENGTH / 60.0
+            r, g, b = config.sky_colour(t)
+            self.assertGreaterEqual(r, 0.0); self.assertLessEqual(r, 1.0)
+            self.assertGreaterEqual(g, 0.0); self.assertLessEqual(g, 1.0)
+            self.assertGreaterEqual(b, 0.0); self.assertLessEqual(b, 1.0)
+
+    def test_midday_matches_sky_day(self):
+        noon = config.DAY_LENGTH / 4.0
+        result = config.sky_colour(noon)
+        for a, b in zip(result, config.SKY_DAY):
+            self.assertAlmostEqual(a, b, places=5)
+
+    def test_midnight_matches_sky_night(self):
+        midnight = config.DAY_LENGTH * 3.0 / 4.0
+        result = config.sky_colour(midnight)
+        for a, b in zip(result, config.SKY_NIGHT):
+            self.assertAlmostEqual(a, b, places=5)
+
+    def test_dawn_matches_sky_dawn(self):
+        result = config.sky_colour(0.0)
+        for a, b in zip(result, config.SKY_DAWN):
+            self.assertAlmostEqual(a, b, places=5)
+
+    def test_dusk_matches_sky_dusk(self):
+        dusk = config.DAY_LENGTH / 2.0
+        result = config.sky_colour(dusk)
+        for a, b in zip(result, config.SKY_DUSK):
+            self.assertAlmostEqual(a, b, places=5)
+
+    def test_midday_is_bluest_period(self):
+        noon = config.DAY_LENGTH / 4.0
+        midnight = config.DAY_LENGTH * 3.0 / 4.0
+        self.assertGreater(config.sky_colour(noon)[2], config.sky_colour(midnight)[2])
+
+    def test_continuous_no_sudden_jumps(self):
+        # No two adjacent samples should differ by more than 0.15 per channel
+        step = config.DAY_LENGTH / 200.0
+        prev = config.sky_colour(0.0)
+        for i in range(1, 201):
+            curr = config.sky_colour(i * step)
+            for a, b in zip(prev, curr):
+                self.assertLess(abs(a - b), 0.15, "Sky colour jumped discontinuously")
+            prev = curr
+
+    def test_wraps_correctly(self):
+        t = 77.7
+        a = config.sky_colour(t)
+        b = config.sky_colour(t + config.DAY_LENGTH)
+        for ca, cb in zip(a, b):
+            self.assertAlmostEqual(ca, cb, places=5)
+
+    def test_morning_brighter_than_night(self):
+        morning = config.sky_colour(config.DAY_LENGTH / 8.0)
+        night   = config.sky_colour(config.DAY_LENGTH * 5.0 / 8.0)
+        self.assertGreater(sum(morning), sum(night))
+
+
+# ===========================================================================
+# Frustum culling
+# ===========================================================================
+
+def _make_vp(eye_x=64, eye_y=20, eye_z=64,
+             look_dx=1, look_dy=0, look_dz=0,
+             fov=80.0, aspect=16/9,
+             z_near=0.1, z_far=60.0):
+    """Build a combined VP matrix (flat 16-float column-major list) using pure Python.
+
+    Avoids pyglet.math so it works under the headless stub.
+    """
+    import math
+
+    # --- perspective projection (column-major, OpenGL convention) ---
+    f = 1.0 / math.tan(math.radians(fov) / 2.0)
+    nf = 1.0 / (z_near - z_far)
+    proj = [
+        f/aspect, 0,  0,               0,
+        0,        f,  0,               0,
+        0,        0,  (z_far+z_near)*nf, -1,
+        0,        0,  2*z_far*z_near*nf,  0,
+    ]
+
+    # --- look-at view matrix ---
+    # forward = normalise(target - eye)
+    fx, fy, fz = look_dx, look_dy, look_dz
+    fl = math.sqrt(fx*fx + fy*fy + fz*fz)
+    fx, fy, fz = fx/fl, fy/fl, fz/fl
+
+    # right = forward × up
+    ux, uy, uz = 0, 1, 0
+    rx = fy*uz - fz*uy
+    ry = fz*ux - fx*uz
+    rz = fx*uy - fy*ux
+    rl = math.sqrt(rx*rx + ry*ry + rz*rz)
+    rx, ry, rz = rx/rl, ry/rl, rz/rl
+
+    # true up = right × forward
+    tux = ry*fz - rz*fy
+    tuy = rz*fx - rx*fz
+    tuz = rx*fy - ry*fx
+
+    tx = -(rx*eye_x + ry*eye_y + rz*eye_z)
+    ty = -(tux*eye_x + tuy*eye_y + tuz*eye_z)
+    tz = fx*eye_x + fy*eye_y + fz*eye_z
+
+    view = [
+        rx,   tux,  -fx,  0,
+        ry,   tuy,  -fy,  0,
+        rz,   tuz,  -fz,  0,
+        tx,   ty,    tz,  1,
+    ]
+
+    # --- multiply proj @ view (column-major 4×4) ---
+    def mat_mul(a, b):
+        result = [0.0] * 16
+        for col in range(4):
+            for row in range(4):
+                s = 0.0
+                for k in range(4):
+                    s += a[k*4 + row] * b[col*4 + k]
+                result[col*4 + row] = s
+        return result
+
+    return mat_mul(proj, view)
+
+
+class TestExtractFrustumPlanes(unittest.TestCase):
+
+    def test_returns_six_planes(self):
+        vp = _make_vp()
+        planes = extract_frustum_planes(vp)
+        self.assertEqual(len(planes), 6)
+
+    def test_each_plane_is_tuple_of_four(self):
+        planes = extract_frustum_planes(_make_vp())
+        for p in planes:
+            self.assertEqual(len(p), 4)
+
+    def test_planes_are_normalised(self):
+        import math
+        planes = extract_frustum_planes(_make_vp())
+        for a, b, c, d in planes:
+            length = math.sqrt(a*a + b*b + c*c)
+            self.assertAlmostEqual(length, 1.0, places=5)
+
+    def test_point_ahead_is_inside_all_planes(self):
+        # Camera at (64,20,64) looking +x; point 5 units ahead
+        planes = extract_frustum_planes(_make_vp())
+        x, y, z = 69, 20, 64
+        for a, b, c, d in planes:
+            self.assertGreaterEqual(a*x + b*y + c*z + d, 0,
+                                    "Point directly ahead should be inside frustum")
+
+    def test_point_directly_behind_is_outside(self):
+        # Camera looking +x; point behind = lower x
+        planes = extract_frustum_planes(_make_vp())
+        x, y, z = 60, 20, 64   # behind camera
+        results = [a*x + b*y + c*z + d for a, b, c, d in planes]
+        self.assertTrue(any(r < 0 for r in results),
+                        "Point behind camera should fail at least one plane")
+
+    def test_point_beyond_far_plane_is_outside(self):
+        # z_far=60; point 200 units ahead should be outside
+        planes = extract_frustum_planes(_make_vp())
+        x, y, z = 264, 20, 64
+        results = [a*x + b*y + c*z + d for a, b, c, d in planes]
+        self.assertTrue(any(r < 0 for r in results))
+
+    def test_different_view_directions_give_different_planes(self):
+        planes_x = extract_frustum_planes(_make_vp(look_dx=1, look_dz=0))
+        planes_z = extract_frustum_planes(_make_vp(look_dx=0, look_dz=1))
+        self.assertNotEqual(planes_x, planes_z)
+
+
+class TestAABBOutsideFrustum(unittest.TestCase):
+
+    def setUp(self):
+        # Camera at (64,20,64) looking +x
+        self.planes = extract_frustum_planes(_make_vp())
+
+    def test_box_ahead_is_not_culled(self):
+        # Box from x=70..86 (ahead of camera), centred on camera z
+        self.assertFalse(aabb_outside_frustum(
+            self.planes, 70, 0, 56, 86, 64, 72))
+
+    def test_box_behind_is_culled(self):
+        # Box entirely behind camera
+        self.assertTrue(aabb_outside_frustum(
+            self.planes, 40, 0, 56, 56, 64, 72))
+
+    def test_box_beyond_far_plane_is_culled(self):
+        # Beyond z_far=60 units ahead: x > 64+60 = 124
+        self.assertTrue(aabb_outside_frustum(
+            self.planes, 130, 0, 56, 146, 64, 72))
+
+    def test_box_straddling_near_is_not_culled(self):
+        # Box overlapping camera position — straddles near plane, should pass
+        self.assertFalse(aabb_outside_frustum(
+            self.planes, 63, 0, 56, 80, 64, 72))
+
+    def test_large_box_enclosing_frustum_is_not_culled(self):
+        # A box that contains the entire frustum should never be culled
+        self.assertFalse(aabb_outside_frustum(
+            self.planes, 0, 0, 0, 256, 128, 256))
+
+    def test_returns_bool(self):
+        result = aabb_outside_frustum(self.planes, 0, 0, 0, 16, 64, 16)
+        self.assertIsInstance(result, bool)
+
+
+class TestSectorAABB(unittest.TestCase):
+
+    def test_origin_sector(self):
+        mn_x, mn_y, mn_z, mx_x, mx_y, mx_z = sector_aabb((0, 0, 0))
+        self.assertEqual(mn_x, 0)
+        self.assertEqual(mn_z, 0)
+        self.assertEqual(mx_x, config.SECTOR_SIZE)
+        self.assertEqual(mx_z, config.SECTOR_SIZE)
+
+    def test_sector_size_matches_config(self):
+        s = config.SECTOR_SIZE
+        mn_x, mn_y, mn_z, mx_x, mx_y, mx_z = sector_aabb((1, 0, 1))
+        self.assertEqual(mx_x - mn_x, s)
+        self.assertEqual(mx_z - mn_z, s)
+
+    def test_y_spans_world_height(self):
+        mn_x, mn_y, mn_z, mx_x, mx_y, mx_z = sector_aabb((2, 0, 3))
+        self.assertEqual(mn_y, 0)
+        self.assertEqual(mx_y, 64)
+
+    def test_sector_coords_scale_correctly(self):
+        s = config.SECTOR_SIZE
+        mn_x, mn_y, mn_z, mx_x, mx_y, mx_z = sector_aabb((3, 0, 5))
+        self.assertEqual(mn_x, 3 * s)
+        self.assertEqual(mn_z, 5 * s)
+        self.assertEqual(mx_x, 4 * s)
+        self.assertEqual(mx_z, 6 * s)
+
+    def test_returns_six_values(self):
+        result = sector_aabb((0, 0, 0))
+        self.assertEqual(len(result), 6)
+
+    def test_min_less_than_max(self):
+        mn_x, mn_y, mn_z, mx_x, mx_y, mx_z = sector_aabb((1, 0, 2))
+        self.assertLess(mn_x, mx_x)
+        self.assertLess(mn_y, mx_y)
+        self.assertLess(mn_z, mx_z)
+
+
+class TestModelFrustum(unittest.TestCase):
+    """Test frustum integration on headless Model."""
+
+    def setUp(self):
+        from unittest.mock import patch
+        with patch.object(Model, '_initialize', return_value=None):
+            self.model = Model()
+
+    def test_frustum_planes_start_none(self):
+        self.assertIsNone(self.model.frustum_planes)
+
+    def test_set_frustum_stores_planes(self):
+        vp = _make_vp()
+        self.model.set_frustum(vp)
+        self.assertIsNotNone(self.model.frustum_planes)
+        self.assertEqual(len(self.model.frustum_planes), 6)
+
+    def test_set_frustum_updates_each_call(self):
+        self.model.set_frustum(_make_vp(look_dx=1, look_dz=0))
+        planes_a = list(self.model.frustum_planes)
+        self.model.set_frustum(_make_vp(look_dx=0, look_dz=1))
+        planes_b = list(self.model.frustum_planes)
+        self.assertNotEqual(planes_a, planes_b)
+
+    def test_show_sector_skips_culled_sector(self):
+        # Camera looking +x at (64,20,64); sector behind = (3,0,4) → x 48..64
+        # Add a block in that sector, set frustum, show_sector should skip it
+        self.model.add_block((50, 10, 64), config.GRASS, immediate=False)
+        self.model.set_frustum(_make_vp())
+        self.model.show_sector((3, 0, 4))
+        # Block should NOT have been shown (it's behind the camera)
+        self.assertNotIn((50, 10, 64), self.model.shown)
+
+    def test_show_sector_shows_visible_sector(self):
+        # Sector ahead at (5,0,4) → x 80..96, z 64..80
+        self.model.add_block((82, 10, 66), config.STONE, immediate=False)
+        self.model.set_frustum(_make_vp())
+        self.model.show_sector((5, 0, 4))
+        # Block IS in the frustum — show_sector should have queued it
+        # (shown or queued — immediate=False means it goes to queue)
+        self.assertIn((82, 10, 66), self.model.shown)
+
+    def test_show_sector_works_without_frustum(self):
+        # frustum_planes=None means no culling — all sectors show normally
+        self.model.add_block((10, 5, 10), config.DIRT, immediate=False)
+        self.assertIsNone(self.model.frustum_planes)
+        self.model.show_sector((0, 0, 0))
+        self.assertIn((10, 5, 10), self.model.shown)

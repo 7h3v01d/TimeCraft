@@ -44,6 +44,10 @@ class Window(pyglet.window.Window):
                                        color=(0, 0, 0, 255))
         self._status_message = ''
         self._status_timer = 0.0
+        self._hotbar_batch = None
+        self._hotbar_slot_shapes = []   # background rects + border rects
+        self._hotbar_sprites = []       # one Sprite per slot (texture icon)
+        self._build_hotbar()
         pyglet.clock.schedule_interval(self.update, 1.0 / config.TICKS_PER_SEC)
 
     def set_exclusive_mouse(self, exclusive):
@@ -90,6 +94,7 @@ class Window(pyglet.window.Window):
         if self._status_timer > 0:
             self._status_timer -= dt
         self.model.process_queue()
+        self.model.update_particles(dt)
         sector = sectorize(self.position, config.SECTOR_SIZE)
         if sector != self.sector:
             self.model.change_sectors(self.sector, sector)
@@ -194,6 +199,12 @@ class Window(pyglet.window.Window):
             y = max(-90, min(90, y))
             self.rotation = (x, y)
 
+    def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
+        if self.exclusive:
+            current = self.inventory.index(self.block)
+            n = len(self.inventory)
+            self.block = self.inventory[(current - int(scroll_y)) % n]
+
     def on_key_press(self, symbol, modifiers):
         if symbol == key.W: self.strafe[0] -= 1
         elif symbol == key.S: self.strafe[0] += 1
@@ -230,13 +241,122 @@ class Window(pyglet.window.Window):
     def on_resize(self, width, height):
         self.label.y = height - 10
         self._rebuild_reticle()
+        self._build_hotbar()
+
+    def _build_hotbar(self):
+        """(Re)build the hotbar batch.  Called on init and every resize."""
+        n          = len(self.inventory)
+        slot_size  = config.HOTBAR_SLOT_SIZE
+        padding    = config.HOTBAR_PADDING
+        icon_pad   = config.HOTBAR_ICON_PAD
+        icon_size  = slot_size - icon_pad * 2
+        total_w    = n * slot_size + (n - 1) * padding
+        start_x    = (self.width - total_w) // 2
+        base_y     = config.HOTBAR_Y
+
+        # Load the 4×4 atlas and build a TextureGrid for cell lookups.
+        # We cache this on self so it isn't reloaded every resize.
+        if not hasattr(self, '_atlas_texture'):
+            raw = pyglet.image.load(config.TEXTURE_PATH)
+            grid = pyglet.image.ImageGrid(raw, rows=4, columns=4)
+            self._atlas_grid = pyglet.image.TextureGrid(grid)
+
+        self._hotbar_batch       = pyglet.graphics.Batch()
+        self._hotbar_slot_shapes = []
+        self._hotbar_sprites     = []
+
+        for i, tex in enumerate(self.inventory):
+            sx = start_x + i * (slot_size + padding)
+            sy = base_y
+
+            # Slot background — semi-transparent dark square
+            bg = pyglet.shapes.Rectangle(
+                sx, sy, slot_size, slot_size,
+                color=(30, 30, 30, 160),
+                batch=self._hotbar_batch,
+            )
+            self._hotbar_slot_shapes.append(bg)
+
+            # Texture icon — sampled from the atlas TextureGrid
+            cell = config.TEXTURE_ATLAS_CELL.get(tuple(tex))
+            if cell is not None:
+                col, row = cell
+                region = self._atlas_grid[row, col]
+                sprite = pyglet.sprite.Sprite(
+                    region,
+                    x=sx + icon_pad,
+                    y=sy + icon_pad,
+                    batch=self._hotbar_batch,
+                )
+                sprite.width  = icon_size
+                sprite.height = icon_size
+                self._hotbar_sprites.append(sprite)
+            else:
+                self._hotbar_sprites.append(None)
+
+    def draw_hotbar(self):
+        """Draw the hotbar batch then overlay a highlight on the selected slot."""
+        if self._hotbar_batch is None:
+            return
+
+        n         = len(self.inventory)
+        slot_size = config.HOTBAR_SLOT_SIZE
+        padding   = config.HOTBAR_PADDING
+        total_w   = n * slot_size + (n - 1) * padding
+        start_x   = (self.width - total_w) // 2
+        base_y    = config.HOTBAR_Y
+
+        self._hotbar_batch.draw()
+
+        # Highlight the selected slot with a bright border
+        try:
+            sel = self.inventory.index(self.block)
+        except ValueError:
+            sel = 0
+        sx = start_x + sel * (slot_size + padding)
+        t  = 2   # border thickness
+        border_shapes = []
+        border_batch  = pyglet.graphics.Batch()
+        # Top bar
+        border_shapes.append(pyglet.shapes.Rectangle(sx, base_y + slot_size - t, slot_size, t,     color=(255, 255, 255, 230), batch=border_batch))
+        # Bottom bar
+        border_shapes.append(pyglet.shapes.Rectangle(sx, base_y,                  slot_size, t,     color=(255, 255, 255, 230), batch=border_batch))
+        # Left bar
+        border_shapes.append(pyglet.shapes.Rectangle(sx, base_y,                  t, slot_size,     color=(255, 255, 255, 230), batch=border_batch))
+        # Right bar
+        border_shapes.append(pyglet.shapes.Rectangle(sx + slot_size - t, base_y,  t, slot_size,     color=(255, 255, 255, 230), batch=border_batch))
+        border_batch.draw()
 
     def _rebuild_reticle(self):
-        x, y = self.width // 2, self.height // 2
-        n = 10
-        self.reticle_batch = pyglet.graphics.Batch()
-        pyglet.shapes.Line(x - n, y, x + n, y, thickness=1, color=(0, 0, 0, 255), batch=self.reticle_batch)
-        pyglet.shapes.Line(x, y - n, x, y + n, thickness=1, color=(0, 0, 0, 255), batch=self.reticle_batch)
+        cx, cy = self.width // 2, self.height // 2
+        arm   = 10   # length of each arm from gap edge
+        gap   = 4    # empty space around the centre dot
+        thick = 2    # white line thickness
+
+        self.reticle_batch  = pyglet.graphics.Batch()
+        self._reticle_lines = []   # keep refs — shapes GC themselves if not held
+
+        arms = [
+            (cx - arm - gap, cy, cx - gap,        cy),  # left
+            (cx + gap,        cy, cx + arm + gap,  cy),  # right
+            (cx, cy - arm - gap, cx, cy - gap      ),    # down
+            (cx, cy + gap,       cx, cy + arm + gap),    # up
+        ]
+        # Dark outline drawn first, white fill drawn on top
+        for x1, y1, x2, y2 in arms:
+            self._reticle_lines.append(pyglet.shapes.Line(
+                x1, y1, x2, y2,
+                thickness=thick + 2,
+                color=(0, 0, 0, 180),
+                batch=self.reticle_batch,
+            ))
+        for x1, y1, x2, y2 in arms:
+            self._reticle_lines.append(pyglet.shapes.Line(
+                x1, y1, x2, y2,
+                thickness=thick,
+                color=(255, 255, 255, 230),
+                batch=self.reticle_batch,
+            ))
 
     def set_2d(self):
         width, height = self.get_size()
@@ -269,12 +389,18 @@ class Window(pyglet.window.Window):
         self.view = Mat4.look_at(eye, target, up)
 
     def on_draw(self):
+        r, g, b = config.sky_colour(self.model.game_time)
+        gl.glClearColor(r, g, b, 1.0)
         self.clear()
         self.set_3d()
-        # Push view/projection matrices into both shaders before drawing
+        # Update frustum planes from this frame's view/projection before any sector ops
+        self.model.set_frustum(self.projection @ self.view)
+        # Push view/projection matrices and sun brightness into both shaders
         self.model.set_shader_uniforms(self.view, self.projection)
         self.model.batch.draw()
         self.set_2d()
+        self.draw_particles()
+        self.draw_hotbar()
         self.draw_label()
         self.draw_reticle()
 
@@ -287,6 +413,54 @@ class Window(pyglet.window.Window):
         self.model.delete_save()
         self._status_message = 'Restart to generate new world'
         self._status_timer = 3.0
+
+    def draw_particles(self):
+        """Project living particles into screen space and draw them as quads.
+
+        We're already in the 2-D orthographic pass (set_2d called beforehand).
+        Each particle's world position is multiplied by the last 3-D view and
+        projection matrices to get a clip-space coordinate, which we then
+        convert to window pixels.  Particles behind the camera are skipped.
+        """
+        if not self.model.particles:
+            return
+
+        width, height = self.get_size()
+        half_s = config.PARTICLE_SIZE / 2
+
+        view = self.view
+        proj = self.projection
+
+        batch = pyglet.graphics.Batch()
+        quads = []   # keep references alive until batch.draw()
+
+        for p in self.model.particles:
+            # World → view space
+            vp = view @ (p.x, p.y, p.z, 1.0)
+            if vp.z >= 0:            # behind camera plane
+                continue
+
+            # View → clip space
+            cp = proj @ (vp.x, vp.y, vp.z, vp.w)
+            if cp.w == 0:
+                continue
+
+            # Clip → NDC → window pixels
+            sx = (cp.x / cp.w + 1.0) * 0.5 * width
+            sy = (cp.y / cp.w + 1.0) * 0.5 * height
+
+            # Fade alpha out over lifetime
+            r, g, b, a = p.colour
+            faded_a = int(a * (1.0 - p.alpha_fraction))
+            colour = (r, g, b, faded_a)
+
+            quads.append(pyglet.shapes.Rectangle(
+                sx - half_s, sy - half_s,
+                config.PARTICLE_SIZE, config.PARTICLE_SIZE,
+                color=colour, batch=batch,
+            ))
+
+        batch.draw()
 
     def draw_label(self):
         x, y, z = self.position
