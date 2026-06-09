@@ -903,10 +903,9 @@ class TestModelSpawnPoint(unittest.TestCase):
 
     def test_spawn_skips_water(self):
         m = self._make_model()
-        cx = cz = m.WORLD_SIZE // 2
-        # Place water at surface, stone below
-        m.add_block((cx, 15, cz), config.WATER, immediate=False)
-        m.add_block((cx, 14, cz), config.STONE, immediate=False)
+        # Place water at surface near origin, stone below
+        m.add_block((0, 15, 0), config.WATER, immediate=False)
+        m.add_block((0, 14, 0), config.STONE, immediate=False)
         spawn = m.get_spawn_point()
         # Should land on stone at 14, not water at 15
         self.assertGreater(spawn[1], 14)
@@ -920,15 +919,16 @@ class TestModelSpawnPoint(unittest.TestCase):
 
     def test_spawn_is_floats(self):
         m = self._make_model()
-        m.add_block((64, 25, 64), config.GRASS, immediate=False)
+        m.add_block((0, 25, 0), config.GRASS, immediate=False)
         spawn = m.get_spawn_point()
         for coord in spawn:
             self.assertIsInstance(coord, float)
 
-    def test_world_size_is_128(self):
+    def test_world_is_infinite(self):
+        """Model no longer has a fixed WORLD_SIZE — world grows on demand."""
         with patch.object(Model, '_initialize', return_value=None):
             m = Model()
-        self.assertEqual(m.WORLD_SIZE, 128)
+        self.assertFalse(hasattr(m, 'WORLD_SIZE'))
 
 
 # ===========================================================================
@@ -1886,3 +1886,155 @@ class TestModelFrustum(unittest.TestCase):
         self.assertIsNone(self.model.frustum_planes)
         self.model.show_sector((0, 0, 0))
         self.assertIn((10, 5, 10), self.model.shown)
+
+
+# ===========================================================================
+# Infinite world / chunk system
+# ===========================================================================
+
+class TestInfiniteWorldConfig(unittest.TestCase):
+
+    def test_render_distance_positive(self):
+        self.assertGreater(config.RENDER_DISTANCE, 0)
+
+    def test_evict_distance_greater_than_render(self):
+        self.assertGreater(config.EVICT_DISTANCE, config.RENDER_DISTANCE)
+
+    def test_distances_are_ints(self):
+        self.assertIsInstance(config.RENDER_DISTANCE, int)
+        self.assertIsInstance(config.EVICT_DISTANCE, int)
+
+
+class TestGenerateChunk(unittest.TestCase):
+
+    def _make_model(self):
+        with patch.object(Model, '_initialize', return_value=None):
+            m = Model()
+        m.seed = 42
+        m._gen = __import__('noise_gen').NoiseGen(42)
+        return m
+
+    def test_generate_chunk_adds_blocks(self):
+        m = self._make_model()
+        m.generate_chunk(0, 0)
+        self.assertGreater(len(m.world), 0)
+
+    def test_generate_chunk_marks_as_generated(self):
+        m = self._make_model()
+        m.generate_chunk(3, 5)
+        self.assertIn((3, 5), m.generated_chunks)
+
+    def test_generate_chunk_idempotent(self):
+        m = self._make_model()
+        m.generate_chunk(0, 0)
+        count_after_first = len(m.world)
+        m.generate_chunk(0, 0)
+        self.assertEqual(len(m.world), count_after_first)
+
+    def test_generate_chunk_covers_correct_columns(self):
+        m = self._make_model()
+        S = config.SECTOR_SIZE
+        m.generate_chunk(2, 3)
+        # All world blocks should have x in [32..47], z in [48..63]
+        for (x, y, z) in m.world:
+            self.assertGreaterEqual(x, 2 * S)
+            self.assertLess(x, 3 * S)
+            self.assertGreaterEqual(z, 3 * S)
+            self.assertLess(z, 4 * S)
+
+    def test_generate_negative_chunk(self):
+        m = self._make_model()
+        m.generate_chunk(-1, -1)
+        S = config.SECTOR_SIZE
+        self.assertIn((-1, -1), m.generated_chunks)
+        # Blocks should be in the negative quadrant
+        for (x, y, z) in m.world:
+            self.assertGreaterEqual(x, -S)
+            self.assertLess(x, 0)
+            self.assertGreaterEqual(z, -S)
+            self.assertLess(z, 0)
+
+    def test_generated_chunks_starts_empty(self):
+        with patch.object(Model, '_initialize', return_value=None):
+            m = Model()
+        self.assertEqual(len(m.generated_chunks), 0)
+
+    def test_chunk_blocks_have_valid_y(self):
+        m = self._make_model()
+        m.generate_chunk(0, 0)
+        for (x, y, z) in m.world:
+            self.assertGreaterEqual(y, 0)
+
+    def test_multiple_chunks_dont_overlap(self):
+        m = self._make_model()
+        m.generate_chunk(0, 0)
+        m.generate_chunk(1, 0)
+        S = config.SECTOR_SIZE
+        chunk0 = {pos for pos in m.world if pos[0] < S}
+        chunk1 = {pos for pos in m.world if pos[0] >= S}
+        self.assertEqual(len(chunk0 & chunk1), 0)
+
+    def test_no_gen_when_gen_is_none(self):
+        """Loaded worlds (self._gen=None) don't get terrain overwritten."""
+        with patch.object(Model, '_initialize', return_value=None):
+            m = Model()
+        m._gen = None
+        m.seed = 42
+        m.add_block((5, 5, 5), config.BRICK, immediate=False)
+        m.generate_chunk(0, 0)   # should be a no-op
+        self.assertEqual(len(m.world), 1)
+        self.assertIn((5, 5, 5), m.world)
+
+    def test_deterministic_with_same_seed(self):
+        m1 = self._make_model()
+        m2 = self._make_model()
+        m1.generate_chunk(5, 5)
+        m2.generate_chunk(5, 5)
+        self.assertEqual(set(m1.world.keys()), set(m2.world.keys()))
+
+    def test_different_seeds_give_different_terrain(self):
+        with patch.object(Model, '_initialize', return_value=None):
+            m1 = Model()
+        m1.seed = 1
+        m1._gen = __import__('noise_gen').NoiseGen(1)
+        with patch.object(Model, '_initialize', return_value=None):
+            m2 = Model()
+        m2.seed = 999999
+        m2._gen = __import__('noise_gen').NoiseGen(999999)
+        m1.generate_chunk(0, 0)
+        m2.generate_chunk(0, 0)
+        self.assertNotEqual(set(m1.world.keys()), set(m2.world.keys()))
+
+
+class TestEviction(unittest.TestCase):
+
+    def _make_model(self):
+        with patch.object(Model, '_initialize', return_value=None):
+            m = Model()
+        return m
+
+    def test_evict_sector_removes_blocks(self):
+        m = self._make_model()
+        m.add_block((0, 5, 0), config.GRASS, immediate=False)
+        m.add_block((1, 5, 0), config.STONE, immediate=False)
+        sector = (0, 0, 0)
+        m._evict_sector(sector)
+        self.assertEqual(len(m.world), 0)
+
+    def test_evict_sector_removes_sector_entry(self):
+        m = self._make_model()
+        m.add_block((0, 5, 0), config.GRASS, immediate=False)
+        m._evict_sector((0, 0, 0))
+        self.assertNotIn((0, 0, 0), m.sectors)
+
+    def test_evict_empty_sector_no_error(self):
+        m = self._make_model()
+        m._evict_sector((99, 0, 99))   # should not raise
+
+    def test_evict_does_not_remove_generated_chunk_flag(self):
+        m = self._make_model()
+        m.generated_chunks.add((0, 0))
+        m.add_block((0, 5, 0), config.GRASS, immediate=False)
+        m._evict_sector((0, 0, 0))
+        # Flag should still be set so we don't re-terrain the chunk
+        self.assertIn((0, 0), m.generated_chunks)

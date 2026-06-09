@@ -274,3 +274,9 @@ BLOCK_IDS = [
     'WATER', 'CRYSTAL', 'MAGIC_WATER', 'DIRT', 'SNOW',
     'GLASS', 'PLANKS', 'GRAVEL',
 ]
+
+# ---------------------------------------------------------------------------
+# Infinite world / chunk system
+# ---------------------------------------------------------------------------
+RENDER_DISTANCE = 4   # sectors around player to keep shown (radius)
+EVICT_DISTANCE  = 6   # sectors beyond which blocks are unloaded from world dict

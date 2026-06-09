@@ -160,7 +160,6 @@ class TextureBindGroup(pyglet.graphics.Group):
 
 class Model(object):
 
-    WORLD_SIZE = 128
     SAVE_FILE  = os.path.join(os.path.dirname(__file__), 'world_save.tcw')
     SAVE_FILE_LEGACY = os.path.join(os.path.dirname(__file__), 'world_save.json')
 
@@ -182,6 +181,7 @@ class Model(object):
         self.sectors = {}
         self.queue = deque()
         self.particles = []
+        self.generated_chunks = set()   # (sx, sz) pairs already terrain-generated
         self.game_time = config.DAY_LENGTH / 4.0  # start at noon
         self.seed = None  # set by _initialize or load_world
         self.frustum_planes = None  # set each frame by set_frustum()
@@ -192,34 +192,57 @@ class Model(object):
     # ------------------------------------------------------------------
 
     def _initialize(self):
-        """Load existing world or generate a fresh one.
+        """Load existing world or start fresh near the origin.
 
-        Checks for a binary save (.tcw) first, then falls back to the
-        legacy JSON save for one-time migration of existing worlds.
+        For a fresh world, just set the seed — actual terrain is generated
+        on-demand by generate_chunk() as the player moves.  The initial
+        chunks around (0,0) are generated here so the player spawns into
+        visible terrain.
         """
         if os.path.exists(self.SAVE_FILE):
             self.load_world()
         elif os.path.exists(self.SAVE_FILE_LEGACY):
-            self.load_world()   # load_world detects format automatically
+            self.load_world()
         else:
-            self._generate_world()
+            self.seed = random.randint(0, 1_000_000)
+            self._gen = NoiseGen(self.seed)
+            # Generate a small area around the origin for the spawn region
+            for sx in range(-1, 2):
+                for sz in range(-1, 2):
+                    self.generate_chunk(sx, sz)
 
-    def _generate_world(self):
-        self.seed = random.randint(0, 1_000_000)
-        n = self.WORLD_SIZE
-        gen = NoiseGen(self.seed)
-        heightMap = [int(gen.getHeight(x, z)) for x in range(n) for z in range(n)]
+    def generate_chunk(self, sx, sz):
+        """Generate terrain for sector (sx, 0, sz) if not already generated.
 
-        for x in range(n):
-            for z in range(n):
-                h = heightMap[x * n + z]
+        Covers world columns (sx*S .. sx*S+S-1, sz*S .. sz*S+S-1) where
+        S = SECTOR_SIZE.  Skips silently if the chunk was already generated
+        or if this world was loaded from a save (in which case the saved
+        block state is authoritative).
+        """
+        if (sx, sz) in self.generated_chunks:
+            return
+        self.generated_chunks.add((sx, sz))
+
+        if not hasattr(self, '_gen') or self._gen is None:
+            return   # loaded world — don't overwrite saved blocks
+
+        S = config.SECTOR_SIZE
+        rng = random.Random(self.seed ^ (sx * 73856093) ^ (sz * 19349663))
+
+        for lx in range(S):
+            for lz in range(S):
+                x = sx * S + lx
+                z = sz * S + lz
+                h = max(1, int(self._gen.getHeight(x, z)))
+
                 if h < 15:
                     self.add_block((x, h, z), config.SAND, immediate=False)
                     for y in range(h, 15):
                         self.add_block((x, y, z),
-                            config.MAGIC_WATER if random.random() > 0.99 else config.WATER,
+                            config.MAGIC_WATER if rng.random() > 0.99 else config.WATER,
                             immediate=False)
                     continue
+
                 if h < 18:
                     self.add_block((x, h, z), config.SAND, immediate=False)
 
@@ -227,18 +250,19 @@ class Model(object):
                 for y in range(h - 1, 0, -1):
                     self.add_block((x, y, z), config.STONE, immediate=False)
 
-                if h > 20 and random.random() > 0.99:
-                    treeHeight = random.randint(5, 7)
-                    for y in range(h + 1, h + treeHeight):
+                if h > 20 and rng.random() > 0.99:
+                    tree_h = rng.randint(5, 7)
+                    for y in range(h + 1, h + tree_h):
                         self.add_block((x, y, z), config.WOOD, immediate=False)
-                    leafh = h + treeHeight
-                    for lz in range(z - 2, z + 3):
-                        for lx in range(x - 2, x + 3):
+                    leafh = h + tree_h
+                    for lz2 in range(z - 2, z + 3):
+                        for lx2 in range(x - 2, x + 3):
                             for ly in range(3):
-                                if (lx, leafh + ly, lz) != (x, leafh + ly, z) or random.random() > 0.1:
-                                    self.add_block((lx, leafh + ly, lz), config.LEAF, immediate=False)
+                                if (lx2, leafh + ly, lz2) != (x, leafh + ly, z) \
+                                        or rng.random() > 0.1:
+                                    self.add_block((lx2, leafh + ly, lz2),
+                                                   config.LEAF, immediate=False)
 
-                # Dirt layer just below grass surface
                 if h > 18:
                     for dy in range(1, min(4, h)):
                         b = (x, h - dy, z)
@@ -246,15 +270,13 @@ class Model(object):
                             self.add_block(b, config.DIRT, immediate=False)
                             break
 
-                # Snow caps on high peaks
                 if h > 30:
                     self.add_block((x, h, z), config.SNOW, immediate=False)
 
-                # Gravel patches near water edges
-                if 18 <= h <= 20 and random.random() > 0.6:
+                if 18 <= h <= 20 and rng.random() > 0.6:
                     self.add_block((x, h, z), config.GRAVEL, immediate=False)
 
-                if h > 25 and random.random() > 0.995:
+                if h > 25 and rng.random() > 0.995:
                     self.add_block((x, h - 1, z), config.CRYSTAL, immediate=False)
 
     # ------------------------------------------------------------------
@@ -262,24 +284,21 @@ class Model(object):
     # ------------------------------------------------------------------
 
     def get_spawn_point(self):
-        """Return (x, y+2, z) at the highest block near world centre."""
-        cx = cz = self.WORLD_SIZE // 2
+        """Return (x, y+2, z) at the highest solid block near the world origin."""
         search_radius = 8
         best = None
         for dx in range(-search_radius, search_radius + 1):
             for dz in range(-search_radius, search_radius + 1):
-                x, z = cx + dx, cz + dz
-                # find highest solid (non-water) block at this column
                 for y in range(60, 0, -1):
-                    if (x, y, z) in self.world:
-                        tex = self.world[(x, y, z)]
+                    if (dx, y, dz) in self.world:
+                        tex = self.world[(dx, y, dz)]
                         if tex not in (config.WATER, config.MAGIC_WATER):
                             if best is None or y > best[1]:
-                                best = (x, y, z)
+                                best = (dx, y, dz)
                             break
         if best:
             return (float(best[0]), float(best[1] + 2), float(best[2]))
-        return (float(cx), 50.0, float(cz))
+        return (0.0, 50.0, 0.0)
 
     # ------------------------------------------------------------------
     # Save / Load
@@ -332,6 +351,7 @@ class Model(object):
 
     def _load_binary(self, path):
         """Read a .tcw binary save file."""
+        self._gen = None   # saved state is authoritative — no terrain overwrite
         with open(path, 'rb') as f:
             magic, version, seed, count = _HEADER_FMT.unpack(
                 f.read(_HEADER_FMT.size))
@@ -341,9 +361,13 @@ class Model(object):
                 x, y, z, bid = _BLOCK_FMT.unpack(f.read(block_size))
                 tex = _BLOCK_ID_TO_TEX.get(bid, config.STONE)
                 self.add_block((x, y, z), tex, immediate=False)
+        # Mark all loaded sectors as generated so they aren't re-terrainformed
+        for sector in self.sectors:
+            self.generated_chunks.add((sector[0], sector[2]))
 
     def _load_json_legacy(self, path):
         """Read a legacy JSON save (pre-v0.8).  Used for one-time migration."""
+        self._gen = None   # saved state is authoritative
         with open(path, 'r') as f:
             data = json.load(f)
         self.seed = data.get('seed')
@@ -351,6 +375,8 @@ class Model(object):
             pos = tuple(entry['pos'])
             tex = _TEXTURE_NAMES.get(entry['tex'], config.STONE)
             self.add_block(pos, tex, immediate=False)
+        for sector in self.sectors:
+            self.generated_chunks.add((sector[0], sector[2]))
 
     def delete_save(self):
         """Remove save file(s) so next launch regenerates the world."""
@@ -485,24 +511,73 @@ class Model(object):
         self.frustum_planes = extract_frustum_planes(vp_matrix)
 
     def change_sectors(self, before, after):
+        """Update visible sectors as the player moves.
+
+        - Generates terrain for any newly entered sector not yet generated.
+        - Shows blocks in sectors entering the render radius.
+        - Hides blocks in sectors leaving the render radius.
+        - Evicts blocks from world dict for sectors beyond EVICT_DISTANCE,
+          keeping memory bounded regardless of how far the player travels.
+        """
+        pad   = config.RENDER_DISTANCE
+        evict = config.EVICT_DISTANCE
+
         before_set = set()
-        after_set = set()
-        pad = 4
-        for dx in range(-pad, pad + 1):
-            for dy in [0]:
-                for dz in range(-pad, pad + 1):
-                    if dx ** 2 + dy ** 2 + dz ** 2 > (pad + 1) ** 2:
-                        continue
-                    if before:
-                        bx, by, bz = before
-                        before_set.add((bx + dx, by + dy, bz + dz))
-                    if after:
-                        ax, ay, az = after
-                        after_set.add((ax + dx, ay + dy, az + dz))
+        after_set  = set()
+        evict_set  = set()
+
+        for dx in range(-evict, evict + 1):
+            for dz in range(-evict, evict + 1):
+                dist = abs(dx) + abs(dz)   # Manhattan — cheap, good enough
+                if after:
+                    ax, _ay, az = after
+                    s = (ax + dx, 0, az + dz)
+                    if dist <= pad:
+                        after_set.add(s)
+                    if dist > evict:
+                        evict_set.add(s)
+                if before:
+                    bx, _by, bz = before
+                    s = (bx + dx, 0, bz + dz)
+                    if dist <= pad:
+                        before_set.add(s)
+
+        # Generate terrain for sectors newly in range that haven't been gen'd yet
+        for sector in after_set - before_set:
+            sx, _sy, sz = sector
+            self.generate_chunk(sx, sz)
+
+        # Show blocks entering the pad
         for sector in after_set - before_set:
             self.show_sector(sector)
+
+        # Hide blocks leaving the pad
         for sector in before_set - after_set:
             self.hide_sector(sector)
+
+        # Evict blocks far from the player — remove from world dict entirely
+        if after:
+            ax, _ay, az = after
+            for dx in range(-evict, evict + 1):
+                for dz in range(-evict, evict + 1):
+                    if abs(dx) + abs(dz) > evict:
+                        sector = (ax + dx, 0, az + dz)
+                        self._evict_sector(sector)
+
+    def _evict_sector(self, sector):
+        """Remove all blocks in *sector* from the world dict and GPU batch.
+
+        The generated_chunks entry is kept so the sector isn't re-generated
+        if the player returns — it will be loaded from the save instead.
+        """
+        positions = list(self.sectors.get(sector, []))
+        for position in positions:
+            if position in self.shown:
+                self.hide_block(position, immediate=True)
+            if position in self.world:
+                del self.world[position]
+        if sector in self.sectors:
+            del self.sectors[sector]
 
     def _enqueue(self, func, *args):
         self.queue.append((func, args))
