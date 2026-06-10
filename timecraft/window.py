@@ -1,6 +1,7 @@
 # window.py
 
 import math
+import os
 import pyglet
 from pyglet.gl import gl
 from pyglet.window import key, mouse
@@ -8,9 +9,37 @@ from pyglet.math import Mat4, Vec3
 import config
 from model import Model
 from util import sectorize, normalize
+from sounds import SoundManager
+from sky import SkyRenderer
+from mob_renderer import MobRenderer
 
 
 class Window(pyglet.window.Window):
+
+    @staticmethod
+    def _make_highlight_shader():
+        """Minimal shader for drawing the block wireframe highlight."""
+        vert = """
+#version 330 core
+in vec3 position;
+uniform mat4 view;
+uniform mat4 projection;
+void main() {
+    gl_Position = projection * view * vec4(position, 1.0);
+}
+"""
+        frag = """
+#version 330 core
+out vec4 out_color;
+void main() {
+    out_color = vec4(0.0, 0.0, 0.0, 0.6);
+}
+"""
+        return pyglet.graphics.shader.ShaderProgram(
+            pyglet.graphics.shader.Shader(vert, 'vertex'),
+            pyglet.graphics.shader.Shader(frag, 'fragment'),
+        )
+
     def __init__(self, *args, **kwargs):
         super(Window, self).__init__(*args, **kwargs)
         self.exclusive = False
@@ -39,11 +68,22 @@ class Window(pyglet.window.Window):
             key._6, key._7, key._8, key._9, key._0]
         self.model = Model()
         self.position = self.model.get_spawn_point()
+        self.default_shader_highlight = self._make_highlight_shader()
+        self._sky = SkyRenderer()
+        self._sky.build()
+        atlas_path = os.path.join(os.path.dirname(__file__), 'mob_atlas.png')
+        self._mob_renderer = MobRenderer()
+        self._mob_renderer.build(atlas_path)
         self.label = pyglet.text.Label('', font_name='Arial', font_size=18,
                                        x=10, y=self.height - 10, anchor_x='left', anchor_y='top',
                                        color=(0, 0, 0, 255))
         self._status_message = ''
         self._status_timer = 0.0
+        self._targeted_block = None
+        self._minimap_sprite = None
+        self._minimap_last_block = None
+        self._minimap_timer = 0.0         # seconds since last minimap rebuild
+        self._sounds = SoundManager()
         self._hotbar_batch = None
         self._hotbar_slot_shapes = []
         self._hotbar_sprites = []
@@ -93,8 +133,32 @@ class Window(pyglet.window.Window):
             self.fps = 1.0 / dt
         if self._status_timer > 0:
             self._status_timer -= dt
+        self._minimap_timer += dt
         self.model.process_queue()
         self.model.update_particles(dt)
+        self.model.mobs.update(
+            dt, self.position,
+            self.model.world,
+            config.PORTAL_TEX,
+            top_surface=self.model.top_surface,
+        )
+        self.model.weather.update(
+            dt, self.position,
+            self.model._temp_gen,
+            self.model._moist_gen,
+        )
+        # Portal timer — notify player if it closes
+        if self.model.portal.update(dt):
+            self._status_message = "Portal closed"
+            self._status_timer = 3.0
+        # Portal teleport check
+        result = self.model.portal.check_teleport(self.position)
+        if result is not None:
+            dest, new_dy = result
+            self.position = (float(dest[0]), float(dest[1]), float(dest[2]))
+            self.dy = new_dy
+            self._status_message = "Wormhole!"
+            self._status_timer = 3.0
         sector = sectorize(self.position, config.SECTOR_SIZE)
         if sector != self.sector:
             self.model.change_sectors(self.sector, sector)
@@ -150,32 +214,16 @@ class Window(pyglet.window.Window):
                 self.fov_offset -= config.SPRINT_FOV
 
     def collide(self, position, height):
-        pad = 0.25
-        p = list(position)
-        np = normalize(position)
-        self.collision_types = {"top": False, "bottom": False, "right": False, "left": False}
-        for face in config.FACES:
-            for i in range(3):
-                if not face[i]:
-                    continue
-                d = (p[i] - np[i]) * face[i]
-                if d < pad:
-                    continue
-                for dy in range(int(height)):
-                    op = list(np)
-                    op[1] -= dy
-                    op[i] += face[i]
-                    if tuple(op) not in self.model.world:
-                        continue
-                    p[i] -= (d - pad) * face[i]
-                    if face == (0, -1, 0):
-                        self.collision_types["top"] = True
-                        self.dy = 0
-                    if face == (0, 1, 0):
-                        self.collision_types["bottom"] = True
-                        self.dy = 0
-                    break
-        return tuple(p)
+        """Resolve AABB collision for the player, delegating to util.collide()."""
+        from util import collide as _collide
+        self.collision_types = {"top": False, "bottom": False,
+                                "right": False, "left": False}
+        new_pos, on_ground = _collide(
+            position, height, self.model.world, config.PORTAL_TEX)
+        if on_ground:
+            self.collision_types['top'] = True
+            self.dy = 0
+        return new_pos
 
     def on_mouse_press(self, x, y, button, modifiers):
         if self.exclusive:
@@ -184,9 +232,13 @@ class Window(pyglet.window.Window):
             if (button == mouse.RIGHT) or ((button == mouse.LEFT) and (modifiers & key.MOD_CTRL)):
                 if previous:
                     self.model.add_block(previous, self.block, hit_vector=vector)
+                    category = config.BLOCK_SOUND_MAP.get(tuple(self.block), 'stone')
+                    self._sounds.play(f'{category}_place')
             elif button == pyglet.window.mouse.LEFT and block:
                 texture = self.model.world[block]
                 if texture != config.STONE:
+                    category = config.BLOCK_SOUND_MAP.get(tuple(texture), 'stone')
+                    self._sounds.play(f'{category}_break')
                     self.model.remove_block(block, hit_vector=vector)
         else:
             self.set_exclusive_mouse(True)
@@ -225,6 +277,9 @@ class Window(pyglet.window.Window):
         elif symbol == key.TAB: self.flying = not self.flying
         elif symbol == key.F5: self._save_world()
         elif symbol == key.F6: self._new_world()
+        elif symbol == key.G:
+            if self.exclusive:
+                self._fire_portal()
         elif symbol in self.num_keys:
             index = (symbol - self.num_keys[0]) % len(self.inventory)
             self.block = self.inventory[index]
@@ -369,7 +424,7 @@ class Window(pyglet.window.Window):
         gl.glEnable(gl.GL_DEPTH_TEST)
         fov = config.PLAYER_FOV + self.fov_offset
         aspect = width / float(height)
-        self.projection = Mat4.perspective_projection(aspect, z_near=0.1, z_far=60.0, fov=fov)
+        self.projection = Mat4.perspective_projection(aspect, z_near=0.1, z_far=120.0, fov=fov)
 
         rx, ry = self.rotation
         px, py, pz = self.position
@@ -389,6 +444,9 @@ class Window(pyglet.window.Window):
         self.view = Mat4.look_at(eye, target, up)
 
     def on_draw(self):
+        # Update targeted block once per frame in draw pass — not in physics loop
+        vector = self.get_sight_vector()
+        self._targeted_block, _ = self.model.hit_test(self.position, vector)
         r, g, b = config.sky_colour(self.model.game_time)
         gl.glClearColor(r, g, b, 1.0)
         self.clear()
@@ -397,10 +455,24 @@ class Window(pyglet.window.Window):
         self.model.set_frustum(self.projection @ self.view)
         # Push view/projection matrices and sun brightness into both shaders
         self.model.set_shader_uniforms(self.view, self.projection)
+        self._sky.draw(
+            self.model.game_time,
+            self.position,
+            self.view,
+            self.projection,
+            fog_density=self.model.weather.fog_density,
+            weather_type=self.model.weather.weather_type,
+        )
         self.model.batch.draw()
+        self.draw_mobs()
+        self.draw_highlight()
         self.set_2d()
         self.draw_particles()
+        self.draw_weather_particles()
+        self.draw_portals()
         self.draw_hotbar()
+        self.draw_minimap()
+        self.draw_portal_compass()
         self.draw_label()
         self.draw_reticle()
 
@@ -462,12 +534,277 @@ class Window(pyglet.window.Window):
 
         batch.draw()
 
+    def _fire_portal(self):
+        """Fire the wormhole gun — place next portal end on the aimed surface."""
+        vector = self.get_sight_vector()
+        block, previous = self.model.hit_test(
+            self.position, vector, max_distance=config.PORTAL_REACH)
+        if previous is None:
+            self._status_message = "No surface in range"
+            self._status_timer = 3.0
+            return
+        # Face normal = direction from previous (air) to block (solid)
+        if block is not None:
+            nx = int(round(previous[0] - block[0]))
+            ny = int(round(previous[1] - block[1]))
+            nz = int(round(previous[2] - block[2]))
+        else:
+            nx, ny, nz = 0, 1, 0   # fallback: upward
+        self.model.portal.fire(previous, (nx, ny, nz))
+        self._status_message = self.model.portal.status
+        self._status_timer = 3.0
+
+    def draw_weather_particles(self):
+        """Project and draw rain/snow particles in the 2D HUD pass."""
+        if not self.model.weather.particles:
+            return
+
+        width, height = self.get_size()
+        view = self.view
+        proj = self.projection
+
+        batch = pyglet.graphics.Batch()
+        quads = []
+
+        for p in self.model.weather.particles:
+            vp = view @ (p.x, p.y, p.z, 1.0)
+            if vp.z >= 0:
+                continue
+            cp = proj @ (vp.x, vp.y, vp.z, vp.w)
+            if cp.w == 0:
+                continue
+            sx = (cp.x / cp.w + 1.0) * 0.5 * width
+            sy = (cp.y / cp.w + 1.0) * 0.5 * height
+            r, g, b, a = p.colour
+            # Fade in quickly, hold, then fade out
+            fade = 1.0 - p.alpha_fraction
+            faded_a = int(a * fade)
+            half_s = p.size / 2
+            quads.append(pyglet.shapes.Rectangle(
+                sx - half_s, sy - half_s,
+                p.size, p.size,
+                color=(r, g, b, faded_a),
+                batch=batch,
+            ))
+
+        batch.draw()
+
+    def draw_portals(self):
+        """Portal blocks render via the world batch — nothing extra needed here."""
+        pass
+
+    def draw_mobs(self):
+        """Render mob sprites via MobRenderer."""
+        self._mob_renderer.draw(
+            self.model.mobs.mobs,
+            self.view,
+            self.projection,
+            self.model.game_time,
+            config.sun_brightness(self.model.game_time),
+        )
+
+    def draw_highlight(self):
+        """Draw a white wireframe outline around the targeted block.
+
+        Called in the 3D pass (after set_3d, before set_2d) so it sits in
+        world space with correct depth.  Uses a simple shader-free GL line
+        draw via pyglet's legacy immediate path — fine for 12 lines/frame.
+        """
+        block = self._targeted_block
+        if block is None:
+            return
+
+        x, y, z = block
+        n = 0.503   # slightly larger than 0.5 to avoid z-fighting
+
+        # 8 corners of the cube
+        corners = [
+            (x-n, y-n, z-n), (x+n, y-n, z-n),
+            (x+n, y+n, z-n), (x-n, y+n, z-n),
+            (x-n, y-n, z+n), (x+n, y-n, z+n),
+            (x+n, y+n, z+n), (x-n, y+n, z+n),
+        ]
+        # 12 edges (pairs of corner indices)
+        edges = [
+            (0,1),(1,2),(2,3),(3,0),  # back face
+            (4,5),(5,6),(6,7),(7,4),  # front face
+            (0,4),(1,5),(2,6),(3,7),  # connecting edges
+        ]
+
+        verts = []
+        for a, b in edges:
+            verts.extend(corners[a])
+            verts.extend(corners[b])
+
+        # Build a one-shot vertex list and draw it
+        vl = self.default_shader_highlight.vertex_list(
+            len(edges) * 2, gl.GL_LINES,
+            position=('f', verts),
+        )
+        self.default_shader_highlight.use()
+        self.default_shader_highlight['view']       = list(self.view)
+        self.default_shader_highlight['projection'] = list(self.projection)
+        vl.draw(gl.GL_LINES)
+        self.default_shader_highlight.stop()
+        vl.delete()
+
+    def draw_minimap(self):
+        """Draw a top-down minimap in the bottom-right corner.
+
+        Rebuilds the texture at most every MINIMAP_REFRESH seconds to avoid
+        CPU spikes from scanning the world dict on every frame.
+        """
+        size   = config.MINIMAP_SIZE
+        margin = config.MINIMAP_MARGIN
+
+        # Rate-limited rebuild
+        if self._minimap_sprite is None or \
+                self._minimap_timer >= config.MINIMAP_REFRESH:
+            self._minimap_timer = 0.0
+            raw = self.model.build_minimap_data(self.position)
+            img = pyglet.image.ImageData(size, size, 'RGBA', raw)
+            tex = img.get_texture()
+            self._minimap_sprite = pyglet.sprite.Sprite(
+                tex,
+                x=self.width  - size - margin,
+                y=margin,
+            )
+
+        if self._minimap_sprite is None:
+            return
+
+        # Reposition in case window was resized
+        self._minimap_sprite.x = self.width - size - margin
+        self._minimap_sprite.y = margin
+
+        # Dark background border
+        bx = self._minimap_sprite.x - 2
+        by = self._minimap_sprite.y - 2
+        batch = pyglet.graphics.Batch()
+        bg = pyglet.shapes.Rectangle(bx, by, size + 4, size + 4,
+                                     color=(0, 0, 0, 160), batch=batch)
+        batch.draw()
+        self._minimap_sprite.draw()
+
+        # Player dot — white, centre of map
+        cx = self._minimap_sprite.x + size // 2
+        cy = self._minimap_sprite.y + size // 2
+        dot_batch = pyglet.graphics.Batch()
+        dot_shapes = [
+            pyglet.shapes.Circle(cx, cy, 3, color=(255, 255, 255, 255),
+                                 batch=dot_batch),
+        ]
+
+        # Facing direction tick — short line from dot in look direction
+        yaw = math.radians(self.rotation[0])
+        tx = cx + math.cos(yaw - math.pi/2) * 6
+        ty = cy + math.sin(yaw - math.pi/2) * 6
+        dot_shapes.append(pyglet.shapes.Line(cx, cy, tx, ty,
+                                             thickness=2,
+                                             color=(255, 255, 255, 200),
+                                             batch=dot_batch))
+        dot_batch.draw()
+
+    def draw_portal_compass(self):
+        """Draw screen-edge bearing indicators for each active portal end.
+
+        Each indicator is a filled circle with an A or B label and distance.
+        When the portal is within the FOV it draws near the crosshair;
+        when off-screen it clamps to the screen edge so the player always
+        knows which direction to walk.
+        """
+        portal = self.model.portal
+        ends = [(portal.a, 'A', config.PORTAL_COLOR_A),
+                (portal.b, 'B', config.PORTAL_COLOR_B)]
+        ends = [(e, lbl, col) for e, lbl, col in ends if e is not None]
+        if not ends:
+            return
+
+        w, h   = self.width, self.height
+        cx, cy = w // 2, h // 2
+        margin = config.COMPASS_MARGIN
+        r      = config.COMPASS_ARROW_R
+        px, py, pz = self.position
+        yaw = math.radians(self.rotation[0])   # player facing angle
+
+        batch  = pyglet.graphics.Batch()
+        shapes = []
+        labels = []
+
+        for end, lbl, colour in ends:
+            # World vector from player to portal
+            dx = end.x - px
+            dz = end.z - pz
+            dist = math.sqrt(dx*dx + dz*dz)
+
+            # World bearing → screen bearing (relative to player facing)
+            world_bearing = math.atan2(dx, -dz)
+            screen_bearing = world_bearing - yaw + math.pi / 2
+
+            # Project onto screen edge if off-screen, else near centre
+            sdx = math.cos(screen_bearing)
+            sdy = math.sin(screen_bearing)
+
+            # Find edge intersection
+            if abs(sdx) > 1e-6:
+                tx = (w/2 - margin) / abs(sdx)
+            else:
+                tx = float('inf')
+            if abs(sdy) > 1e-6:
+                ty = (h/2 - margin) / abs(sdy)
+            else:
+                ty = float('inf')
+            t  = min(tx, ty)
+            sx = cx + sdx * t
+            sy = cy + sdy * t
+
+            # Clamp to screen bounds
+            sx = max(margin, min(w - margin, sx))
+            sy = max(margin, min(h - margin, sy))
+
+            # Draw indicator circle
+            cr, cg, cb, ca = colour
+            shapes.append(pyglet.shapes.Circle(
+                sx, sy, r, color=(cr, cg, cb, 200), batch=batch))
+            # Dark outline
+            shapes.append(pyglet.shapes.Circle(
+                sx, sy, r + 2, color=(0, 0, 0, 120), batch=batch))
+            shapes.append(pyglet.shapes.Circle(
+                sx, sy, r, color=(cr, cg, cb, 200), batch=batch))
+
+            # Distance label
+            dist_str = f"{int(dist)}m"
+            if not hasattr(self, f'_compass_label_{lbl}'):
+                setattr(self, f'_compass_label_{lbl}',
+                    pyglet.text.Label('', font_name='Arial', font_size=11,
+                                      anchor_x='center', anchor_y='center',
+                                      color=(255, 255, 255, 255)))
+            label = getattr(self, f'_compass_label_{lbl}')
+            label.text = f'{lbl} {dist_str}'
+            label.x = sx
+            label.y = sy
+            labels.append(label)
+
+        batch.draw()
+        for lbl in labels:
+            lbl.draw()
+
     def draw_label(self):
         x, y, z = self.position
         self.label.text = '%02d (%.2f, %.2f, %.2f) %d / %d' % (
             self.fps, x, y, z,
             len(self.model._shown), len(self.model.world))
         self.label.draw()
+        # Portal status line
+        if not hasattr(self, '_portal_label'):
+            self._portal_label = pyglet.text.Label(
+                '', font_name='Arial', font_size=13,
+                x=10, y=self.height - 35,
+                anchor_x='left', anchor_y='top',
+                color=(120, 200, 255, 200))
+        self._portal_label.text = f"[G] {self.model.portal.status}"
+        self._portal_label.y = self.height - 35
+        self._portal_label.draw()
         if self._status_timer > 0:
             if not hasattr(self, '_status_label'):
                 self._status_label = pyglet.text.Label(

@@ -1,183 +1,122 @@
-# 🌍 TimeCraft v1.1
+# TimeCraft v1.6
 
-A 3D voxel sandbox engine built in Python with **pyglet** and **OpenGL 3.3 core** — procedurally generated worlds, custom GLSL shaders, real physics, ambient occlusion, a day/night cycle, and a working save/load system.
-
-This started as a learning project and turned into something genuinely playable. Pulled back out of archive and actively developed.
-
----
-
-## 🧠 What is TimeCraft?
-
-TimeCraft is a first-person voxel world — think Minecraft-lite, built from scratch. You spawn into a procedurally generated landscape, walk around, build, and destroy. The world persists between sessions via JSON save files, water moves and shimmers, and the sun rises and sets.
-
-The design goal was to understand every layer of a 3D engine: geometry batching, UV-mapped texture atlases, custom GLSL shaders, sector-based chunk visibility, frustum culling, collision detection, and a deterministic tick loop. No game engine. No shortcuts.
+A 3D infinite voxel sandbox built with Python, pyglet, and OpenGL 3.3 core.
+No external game engine — everything from terrain generation to mob AI is hand-rolled.
 
 ---
 
-## ✨ Features
+## Quick start
 
-**World generation**
-- 128×128 seeded terrain via a custom cosine-interpolated noise generator (`NoiseGen`)
-- Biome-like surface rules: sand near water edges, grass/dirt mid-range, gravel beaches, snow-capped peaks above y=30
-- Procedural tree generation with wood trunks and 3D leaf canopies
-- Rare crystal formations spawning on high terrain
-- Water fills low areas; rare glowing magic water spawns randomly
+```bat
+setup.bat       # create venv + install dependencies (first run only)
+run.bat         # launch the game
+test.bat        # run the test suite (497 tests)
+```
 
-**Rendering**
-- OpenGL 3.3 core profile — no legacy pipeline
-- Dual shader system: a standard block shader and a dedicated animated water shader
-- Water surface animates via sine-wave vertex displacement in GLSL (`water_vertex.glsl`)
-- Fragment shimmer effect on all water; extra glow pulse on magic water (`water_fragment.glsl`)
-- 4×4 texture atlas with 14 named block types (grass, sand, brick, stone, wood, leaf, water, crystal, magic water, dirt, snow, glass, planks, gravel)
-- Per-vertex ambient occlusion baked into the vertex buffer at block-show time — top faces fully lit, sides dimmed, bottom darkest, corners darkened by solid neighbours
-- Sector-based geometry visibility with frustum culling — only sectors near the player and within the camera's view frustum are batched and drawn (~59% of background sectors culled)
-- Splash screen on launch while world generates
-
-**Lighting & atmosphere**
-- Full day/night cycle — 10-minute days with smooth sky colour transitions: dawn (warm orange) → midday (sky blue) → dusk (deep red-orange) → midnight (near-black navy)
-- `sun_brightness` uniform applied to both block and water shaders each frame — world darkens naturally at night
-- Starts at noon on every fresh launch
-
-**Player & physics**
-- First-person camera with yaw/pitch look
-- Walk, sprint, crouch, jump, and fly modes
-- Gravity, terminal velocity, and per-face AABB collision
-- Sprint increases FOV dynamically; crouch lowers eye height
-- Fall-out-of-world respawn safety net
-
-**World interaction**
-- Left-click to remove blocks (stone is indestructible)
-- Right-click (or Ctrl+Left-click) to place the selected block type
-- Block-break particle burst — coloured to match the broken block, gravity physics, alpha fade
-- 12-slot inventory hotbar with atlas texture icons, centred at screen bottom
-- Mouse scroll wheel cycles through hotbar slots
-- Gapped crosshair with white fill and dark outline — readable against any background
-- FPS counter, position display, and status toast messages
-
-**Save / Load**
-- `F5` saves the current world to `world_save.json`
-- World auto-loads on next launch if the save file exists
-- `F6` deletes the save — next launch regenerates a fresh world from a new seed
-- Full block texture roundtrip through named string keys
+Requires Python 3.11+ and a GPU supporting OpenGL 3.3 core.
 
 ---
 
-## 🗂️ Project structure
+## Controls
+
+| Key / Mouse | Action |
+|---|---|
+| W A S D | Move |
+| Mouse | Look |
+| Left click | Break block |
+| Right click | Place block |
+| Scroll wheel | Cycle hotbar |
+| 1 – 9 | Select hotbar slot |
+| Space | Jump |
+| Left Shift | Crouch |
+| R | Sprint |
+| Tab | Toggle fly mode |
+| G | Fire wormhole gun (portal A → B) |
+| F5 | Save world |
+| F6 | New world |
+| Escape | Release mouse |
+
+---
+
+## Features
+
+### World
+- **Infinite procedural terrain** — chunk-based generation with sector eviction; only loaded terrain kept in memory
+- **6 biomes** — Tundra, Taiga, Plains, Forest, Desert, Savanna; driven by independent temperature × moisture noise passes
+- **15 block types** — Grass, Dirt, Sand, Stone, Brick, Wood, Planks, Leaf, Gravel, Glass, Water, Magic Water, Crystal, Snow, Portal
+- **Binary save format** — `.tcw` file, magic `TCWF`, 7 bytes per block; ~5× smaller than JSON; auto-migrates legacy saves
+- **Frustum culling** — Gribb/Hartmann plane extraction; ~59% of sectors culled per frame
+
+### Visuals
+- **Ambient occlusion** — per-vertex, baked into VBO at chunk generation time
+- **Day/night cycle** — sky colour lerps through 4 keypoints (dawn/noon/dusk/midnight); `sun_brightness` uniform drives block lighting
+- **Sky objects** — sun disc with halo, moon (opposite phase), 200 stars (fade in at dusk), 28 fluffy cloud clusters (multi-puff alpha-stacked octagons, drifting)
+- **Weather system** — rain and snow particle emitters; biome-driven (snow in tundra/taiga, rain in forest/plains/savanna, clear in desert); linear fog shrinks draw distance in heavy weather
+- **Fog** — depth-based in default shader; `fog_end` shrinks from 105 blocks (clear) to 18 (peak rain)
+- **Water shader** — animated vertex displacement + shimmer via separate GLSL pair
+- **Block highlight** — wireframe outline on aimed block (dedicated minimal shader, drawn in 3D pass)
+- **Extended draw distance** — `z_far=120`, render distance 6 sectors (96 blocks), frustum culling keeps it responsive
+
+### HUD
+- **Inventory hotbar** — 9 slots, atlas texture icons, scroll wheel cycling, white border highlight
+- **Minimap** — 120×120 px bottom-right; top_surface dict makes rebuild O(pixels) with no y-scan; rate-limited to 0.5s
+- **Portal compass** — screen-edge bearing indicators for each active portal end; shows label + distance; relative to player facing
+- **Crosshair** — gapped, outlined, always visible against any background
+- **Status toasts** — centre-screen messages for portal events, saves, wormhole travel
+
+### Gameplay
+- **Wormhole gun** — press G to fire; first shot = portal A (blue block), second = portal B (orange block); walk through either end to teleport; 30s timer or permanent mode; one pair at a time
+- **Block particles** — per-block RGBA burst on break, with gravity and alpha fade
+- **Block sounds** — 14 procedurally synthesised wavs (stone, dirt, wood, glass, leaf, water, sand); generated on first launch, cached in `sounds/`
+- **Physics** — AABB collision (shared `util.collide()`), gravity, jump, sprint, crouch, fly; portal blocks are walk-through
+
+### Mobs
+- **Entity system** — `Entity` base class with AABB physics; `Mob` subclass with IDLE/WALK state machine wander AI; `MobManager` handles spawning, despawning, rate-limited physics
+- **Chicken** — yellow pixelart sprite, spawns on grass/sand, quick and jittery
+- **Sheep** — white woolly sprite, spawns on grass/snow, slow and calm
+- **Textured billboards** — dedicated mob shader samples `mob_atlas.png` (128×64 RGBA sprite sheet); nearest-neighbour filtering for crisp pixels; leg quads animated with `sin(game_time)` walk cycle; `brightness` uniform matches day/night
+- **Spawning** — uses `top_surface` dict for O(1) surface lookup; spawn ring 6–48 blocks from player; biome-appropriate surfaces only
+
+---
+
+## Architecture
 
 ```
 timecraft/
-├── main.py              # Entry point — splash screen, GL setup, event loop
-├── window.py            # pyglet Window subclass — input, camera, physics, draw
-├── model.py             # World state — gen, sectors, frustum, particles, save/load
-├── config.py            # All constants — physics, AO, hotbar, day/night, shaders
-├── noise_gen.py         # Custom seeded cosine-interpolated terrain noise
-├── util.py              # cube_vertices(), compute_ao(), frustum culling, sectorize()
-├── water_vertex.glsl    # Animated water vertex shader
-├── water_fragment.glsl  # Water shimmer + magic water + sun_brightness shader
-├── texture.png          # 4×4 block texture atlas
-└── test_timecraft.py    # 221 passing tests (pytest)
-
-setup.bat                # One-shot venv setup + dependency install
-run.bat                  # Activate venv and launch
-test.bat                 # Run pytest
-shell.bat                # Open activated venv shell
-doctor.bat               # Dependency health check
+├── main.py           entry point, splash screen, GL setup
+├── window.py         pyglet Window subclass — input, camera, draw pipeline
+├── model.py          world state, chunk gen, sectors, particles, weather, save/load
+├── config.py         all constants — physics, biomes, weather, mobs, sky, fog
+├── noise_gen.py      seeded cosine-interpolated noise + get_climate()
+├── util.py           cube_vertices, compute_ao, frustum culling, collide(), sectorize()
+├── sky.py            SkyRenderer — sun, moon, stars, fluffy clouds
+├── mobs.py           Entity, Mob, MobManager — AI, physics, spawning
+├── mob_renderer.py   MobRenderer — textured billboard shader + walk animation
+├── sounds.py         procedural wav synthesis, SoundManager (14 sounds)
+├── texture.png       4×4 block atlas (256×256, 64px tiles)
+├── mob_atlas.png     mob sprite sheet (128×64, chicken + sheep)
+├── water_vertex.glsl animated water vertex shader
+├── water_fragment.glsl water shimmer fragment shader
+└── test_timecraft.py 497 tests
 ```
 
 ---
 
-## ▶️ Running TimeCraft
+## Test suite
 
-**Requirements:** Python 3.11+, Windows (batch scripts; engine is cross-platform)
-
-**Quick start:**
-```bat
-setup.bat      :: first time only — creates venv, installs deps
-run.bat        :: launch the game
-```
-
-**Manual:**
-```bash
-python -m pip install -r requirements.txt
-python timecraft/main.py
-```
-
-**Dependencies** (`requirements.txt`):
-```
-pyglet==2.1.14
-PyOpenGL==3.1.10
-PyOpenGL-accelerate==3.1.10
-pytest
-```
-
----
-
-## 🎮 Controls
-
-| Key / Button | Action |
-|---|---|
-| `W A S D` | Move |
-| `Mouse` | Look |
-| `Space` | Jump |
-| `R` | Sprint |
-| `Left Shift` | Crouch |
-| `Tab` | Toggle fly mode |
-| `C` (hold) | Zoom |
-| `1–0` | Select block type |
-| `Scroll wheel` | Cycle hotbar |
-| `Left click` | Remove block |
-| `Right click` | Place block |
-| `F5` | Save world |
-| `F6` | Clear save (new world on restart) |
-| `Esc` | Release mouse |
-
----
-
-## 🧪 Tests
-
-318 tests, all passing. Run with:
 ```bat
 test.bat
 ```
-or:
-```bash
-pytest timecraft/test_timecraft.py -v
-```
 
-Test coverage spans: `normalize`, `sectorize`, `cube_vertices`, config constants, noise generation, quad index generation, world block operations, sector assignment, save/load roundtrip, spawn point logic, all 14 block type definitions, ambient occlusion (AO neighbour table, compute_ao correctness), particle system (Particle dataclass, spawn, update, colour mapping), hotbar config (atlas cell map, slot geometry), day/night cycle (sun_brightness curve, sky_colour transitions), and frustum culling (plane extraction, AABB tests, sector AABB, model integration).
+497 passing, 1 skipped. The skipped test is a seed-dependent desert spawn search — valid behaviour, not a bug.
 
 ---
 
-## ⚠️ Known limitations
+## What's next
 
-- World size is fixed at 128×128
-- No point light sources — lighting is purely sun-driven ambient
-- No entities, mobs, or NPCs
-- No multiplayer
-- Save format is plain JSON — not optimised for large worlds
+- **Crafting** — combine hotbar blocks with C; config recipe dict
+- **Night hostile mobs** — spawns at `sun_brightness < 0.3`, despawns at dawn
+- **Chest storage** — right-click chest block opens HUD inventory; persists in binary save
+- **More mob types** — cow, pig, hostile zombie
+- **Multiplayer** — asyncio client/server, block-delta sync
 
----
-
-## 💡 Where this could go
-
-The architecture already supports growth in several directions:
-
-- Chunked infinite world loading (sector system is designed for it)
-- Block placing sounds (`pyglet.media` already available)
-- Binary save format for performance at scale
-- Biome system (second noise pass for moisture/temperature)
-- Entity and NPC systems (collision infrastructure already solid)
-- Weather and seasonal effects (day/night uniform already flowing)
-- A rendered sun disc in the sky
-
----
-
-## 📜 License
-
-Personal project — unlicensed. Do whatever you like with it.
-
----
-
-## 🏷️ Status
-
-**Active** — v1.1, 318 tests passing, fully playable.

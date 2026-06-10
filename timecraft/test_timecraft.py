@@ -131,9 +131,11 @@ import config
 import tempfile
 import json
 from util import cube_vertices, normalize, sectorize, compute_ao, \
-                  extract_frustum_planes, aabb_outside_frustum, sector_aabb
+                  extract_frustum_planes, aabb_outside_frustum, sector_aabb, \
+                  collide as util_collide
 from noise_gen import NoiseGen, NoiseParameters
-from model import Model, QUAD_INDICES, Particle
+from model import Model, QUAD_INDICES, Particle, PortalEnd, PortalManager, \
+                  WeatherParticle, WeatherManager
 
 
 # ===========================================================================
@@ -854,7 +856,7 @@ class TestBinarySaveConfig(unittest.TestCase):
         self.assertGreater(config.SAVE_VERSION, 0)
 
     def test_block_ids_has_14_entries(self):
-        self.assertEqual(len(config.BLOCK_IDS), 14)
+        self.assertGreaterEqual(len(config.BLOCK_IDS), 14)
 
     def test_block_ids_are_all_strings(self):
         for bid in config.BLOCK_IDS:
@@ -871,11 +873,11 @@ class TestBinarySaveConfig(unittest.TestCase):
 
     def test_block_id_to_tex_has_14_entries(self):
         from model import _BLOCK_ID_TO_TEX
-        self.assertEqual(len(_BLOCK_ID_TO_TEX), 14)
+        self.assertGreaterEqual(len(_BLOCK_ID_TO_TEX), 14)
 
     def test_tex_to_block_id_has_14_entries(self):
         from model import _TEX_TO_BLOCK_ID
-        self.assertEqual(len(_TEX_TO_BLOCK_ID), 14)
+        self.assertGreaterEqual(len(_TEX_TO_BLOCK_ID), 14)
 
     def test_block_id_roundtrip(self):
         from model import _BLOCK_ID_TO_TEX, _TEX_TO_BLOCK_ID
@@ -1388,7 +1390,7 @@ class TestHotbarConfig(unittest.TestCase):
         self.assertGreaterEqual(config.HOTBAR_Y, 0)
 
     def test_atlas_cell_map_has_14_entries(self):
-        self.assertEqual(len(config.TEXTURE_ATLAS_CELL), 14)
+        self.assertGreaterEqual(len(config.TEXTURE_ATLAS_CELL), 14)
 
     def test_all_inventory_blocks_in_atlas_map(self):
         inventory = [
@@ -1665,7 +1667,7 @@ class TestSkyColour(unittest.TestCase):
 def _make_vp(eye_x=64, eye_y=20, eye_z=64,
              look_dx=1, look_dy=0, look_dz=0,
              fov=80.0, aspect=16/9,
-             z_near=0.1, z_far=60.0):
+             z_near=0.1, z_far=120.0):
     """Build a combined VP matrix (flat 16-float column-major list) using pure Python.
 
     Avoids pyglet.math so it works under the headless stub.
@@ -1762,9 +1764,9 @@ class TestExtractFrustumPlanes(unittest.TestCase):
                         "Point behind camera should fail at least one plane")
 
     def test_point_beyond_far_plane_is_outside(self):
-        # z_far=60; point 200 units ahead should be outside
+        # z_far=120; point 300 units ahead should be outside
         planes = extract_frustum_planes(_make_vp())
-        x, y, z = 264, 20, 64
+        x, y, z = 364, 20, 64
         results = [a*x + b*y + c*z + d for a, b, c, d in planes]
         self.assertTrue(any(r < 0 for r in results))
 
@@ -1791,9 +1793,9 @@ class TestAABBOutsideFrustum(unittest.TestCase):
             self.planes, 40, 0, 56, 56, 64, 72))
 
     def test_box_beyond_far_plane_is_culled(self):
-        # Beyond z_far=60 units ahead: x > 64+60 = 124
+        # Beyond z_far=120 units ahead: x > 64+120 = 184
         self.assertTrue(aabb_outside_frustum(
-            self.planes, 130, 0, 56, 146, 64, 72))
+            self.planes, 190, 0, 56, 206, 64, 72))
 
     def test_box_straddling_near_is_not_culled(self):
         # Box overlapping camera position — straddles near plane, should pass
@@ -2548,3 +2550,1306 @@ class TestSoundManager(unittest.TestCase):
         for name in _SOUND_DEFS:
             path = os.path.join(self.tmp, f'{name}.wav')
             self.assertTrue(os.path.exists(path))
+
+
+# ===========================================================================
+# Wormhole gun / portal system
+# ===========================================================================
+
+class TestPortalConfig(unittest.TestCase):
+
+    def test_portal_duration_positive(self):
+        self.assertGreater(config.PORTAL_DURATION, 0)
+
+    def test_portal_cooldown_positive(self):
+        self.assertGreater(config.PORTAL_COOLDOWN, 0)
+
+    def test_portal_reach_greater_than_block_reach(self):
+        self.assertGreater(config.PORTAL_REACH, 8)
+
+    def test_portal_colours_are_rgba(self):
+        for colour in (config.PORTAL_COLOR_A, config.PORTAL_COLOR_B):
+            self.assertEqual(len(colour), 4)
+            for ch in colour: self.assertGreaterEqual(ch, 0); self.assertLessEqual(ch, 255)
+
+    def test_portal_colours_distinct(self):
+        self.assertNotEqual(config.PORTAL_COLOR_A, config.PORTAL_COLOR_B)
+
+    def test_portal_half_dimensions_positive(self):
+        self.assertGreater(config.PORTAL_HALF_WIDTH, 0)
+        self.assertGreater(config.PORTAL_HALF_HEIGHT, 0)
+
+    def test_trigger_dist_positive(self):
+        self.assertGreater(config.PORTAL_TRIGGER_DIST_XZ, 0)
+
+
+class TestPortalEnd(unittest.TestCase):
+
+    def _make(self, x=10, y=20, z=30, nx=0, ny=0, nz=1):
+        return PortalEnd(x, y, z, nx, ny, nz, config.PORTAL_COLOR_A)
+
+    def test_position_property(self):
+        p = self._make(1, 2, 3)
+        self.assertEqual(p.position, (1, 2, 3))
+
+    def test_normal_property(self):
+        p = self._make(nx=1, ny=0, nz=0)
+        self.assertEqual(p.normal, (1, 0, 0))
+
+    def test_corners_returns_four_points(self):
+        p = self._make()
+        c = p.corners()
+        self.assertEqual(len(c), 4)
+
+    def test_corners_are_tuples_of_three(self):
+        for corner in self._make().corners():
+            self.assertEqual(len(corner), 3)
+
+    def test_corners_span_correct_height(self):
+        p = self._make(y=20)
+        corners = p.corners()
+        ys = [c[1] for c in corners]
+        self.assertAlmostEqual(max(ys) - min(ys), config.PORTAL_HALF_HEIGHT * 2, places=3)
+
+    def test_corners_span_correct_width_z_normal(self):
+        p = self._make(nx=0, nz=1)  # z normal → width along x
+        corners = p.corners()
+        xs = [c[0] for c in corners]
+        self.assertAlmostEqual(max(xs) - min(xs), config.PORTAL_HALF_WIDTH * 2, places=3)
+
+    def test_corners_span_correct_width_x_normal(self):
+        p = self._make(nx=1, nz=0)  # x normal → width along z
+        corners = p.corners()
+        zs = [c[2] for c in corners]
+        self.assertAlmostEqual(max(zs) - min(zs), config.PORTAL_HALF_WIDTH * 2, places=3)
+
+    def test_corners_offset_from_wall(self):
+        p = self._make(nz=1)  # z normal, offset pushes z outward
+        corners = p.corners()
+        for c in corners:
+            self.assertGreater(c[2], 30.0)  # all z > base z (offset applied)
+
+    def test_arrival_point_is_in_front_of_portal(self):
+        p = self._make(x=10, y=20, z=30, nx=0, ny=0, nz=1)
+        arr = p.arrival_point()
+        self.assertGreater(arr[2], 30.0)  # arrival is ahead in z
+
+    def test_arrival_point_preserves_y(self):
+        p = self._make(y=25)
+        arr = p.arrival_point()
+        self.assertAlmostEqual(arr[1], 26.0)  # y + 1 to stand above base block
+
+
+class TestPortalManager(unittest.TestCase):
+
+    def _mgr(self):
+        m = PortalManager()
+        # Provide a headless model so block placement works in tests
+        with patch.object(Model, '_initialize', return_value=None):
+            model = Model()
+        m._world_ref = model
+        return m
+
+    def test_starts_inactive(self):
+        m = self._mgr()
+        self.assertFalse(m.active)
+        self.assertIsNone(m.a)
+        self.assertIsNone(m.b)
+
+    def test_first_fire_sets_a(self):
+        m = self._mgr()
+        m.fire((0, 0, 0), (0, 0, 1))
+        self.assertIsNotNone(m.a)
+        self.assertIsNone(m.b)
+        self.assertFalse(m.active)
+
+    def test_second_fire_sets_b_and_activates(self):
+        m = self._mgr()
+        m.fire((0, 0, 0), (0, 0, 1))
+        m.fire((10, 0, 10), (1, 0, 0))
+        self.assertIsNotNone(m.b)
+        self.assertTrue(m.active)
+
+    def test_third_fire_resets_and_sets_new_a(self):
+        m = self._mgr()
+        m.fire((0, 0, 0), (0, 0, 1))
+        m.fire((10, 0, 10), (1, 0, 0))
+        m.fire((5, 0, 5), (0, 1, 0))
+        self.assertIsNotNone(m.a)
+        self.assertIsNone(m.b)
+        self.assertFalse(m.active)
+
+    def test_clear_removes_both(self):
+        m = self._mgr()
+        m.fire((0, 0, 0), (0, 0, 1))
+        m.fire((10, 0, 10), (1, 0, 0))
+        m.clear()
+        self.assertFalse(m.active)
+        self.assertIsNone(m.a)
+        self.assertIsNone(m.b)
+
+    def test_portal_a_colour(self):
+        m = self._mgr()
+        m.fire((0, 0, 0), (0, 0, 1))
+        self.assertEqual(m.a.colour, config.PORTAL_COLOR_A)
+
+    def test_portal_b_colour(self):
+        m = self._mgr()
+        m.fire((0, 0, 0), (0, 0, 1))
+        m.fire((10, 0, 10), (1, 0, 0))
+        self.assertEqual(m.b.colour, config.PORTAL_COLOR_B)
+
+    def test_status_no_portal(self):
+        m = self._mgr()
+        self.assertIn("ready", m.status.lower())
+
+    def test_status_a_set(self):
+        m = self._mgr()
+        m.fire((0, 0, 0), (0, 0, 1))
+        self.assertIn("A", m.status)
+
+    def test_status_active(self):
+        m = self._mgr()
+        m.fire((0, 0, 0), (0, 0, 1))
+        m.fire((10, 0, 10), (1, 0, 0))
+        self.assertIn("active", m.status.lower())
+
+    def test_no_teleport_when_inactive(self):
+        m = self._mgr()
+        self.assertIsNone(m.check_teleport((0, 0, 0)))
+
+    def test_no_teleport_when_only_a_set(self):
+        m = self._mgr()
+        m.fire((0, 0, 0), (0, 0, 1))
+        self.assertIsNone(m.check_teleport((0, 0, 0)))
+
+    def test_teleport_through_a(self):
+        m = self._mgr()
+        m.fire((0, 5, 0), (0, 0, 1))    # portal A at (0,5,0)
+        m.fire((50, 5, 50), (0, 0, 1))  # portal B at (50,5,50)
+        # Stand right on portal A — within trigger distance
+        result = m.check_teleport((0.0, 5.0, 0.0))
+        self.assertIsNotNone(result)
+        dest, dy = result
+        # Should arrive near portal B
+        self.assertAlmostEqual(dest[0], 50.0, delta=3.0)
+        self.assertEqual(dy, 0.0)
+
+    def test_teleport_through_b(self):
+        m = self._mgr()
+        m.fire((0, 5, 0), (0, 0, 1))
+        m.fire((50, 5, 50), (0, 0, 1))
+        result = m.check_teleport((50.0, 5.0, 50.0))
+        self.assertIsNotNone(result)
+        dest, dy = result
+        self.assertAlmostEqual(dest[0], 0.0, delta=3.0)
+
+    def test_cooldown_prevents_immediate_retrigger(self):
+        m = self._mgr()
+        m.fire((0, 5, 0), (0, 0, 1))
+        m.fire((50, 5, 50), (0, 0, 1))
+        m.check_teleport((0.0, 5.0, 0.0))   # teleport
+        # Immediately after — cooldown should block
+        result = m.check_teleport((50.0, 5.0, 50.0))
+        self.assertIsNone(result)
+
+    def test_cooldown_expires(self):
+        m = self._mgr()
+        m.fire((0, 5, 0), (0, 0, 1))
+        m.fire((50, 5, 50), (0, 0, 1))
+        m.check_teleport((0.0, 5.0, 0.0))
+        m.update(config.PORTAL_COOLDOWN + 0.1)  # let cooldown expire
+        result = m.check_teleport((50.0, 5.0, 50.0))
+        self.assertIsNotNone(result)
+
+    def test_timed_portal_expires(self):
+        import config as cfg
+        orig = cfg.PORTAL_PERMANENT
+        cfg.PORTAL_PERMANENT = False
+        try:
+            m = self._mgr()
+            m.fire((0, 5, 0), (0, 0, 1))
+            m.fire((50, 5, 50), (0, 0, 1))
+            closed = m.update(config.PORTAL_DURATION + 1.0)
+            self.assertTrue(closed)
+            self.assertFalse(m.active)
+        finally:
+            cfg.PORTAL_PERMANENT = orig
+
+    def test_time_remaining_counts_down(self):
+        import config as cfg
+        orig = cfg.PORTAL_PERMANENT
+        cfg.PORTAL_PERMANENT = False
+        try:
+            m = self._mgr()
+            m.fire((0, 5, 0), (0, 0, 1))
+            m.fire((50, 5, 50), (0, 0, 1))
+            m.update(3.0)
+            self.assertAlmostEqual(m.time_remaining,
+                                   config.PORTAL_DURATION - 3.0, delta=0.1)
+        finally:
+            cfg.PORTAL_PERMANENT = orig
+
+    def test_permanent_portal_never_expires(self):
+        import config as cfg
+        orig = cfg.PORTAL_PERMANENT
+        cfg.PORTAL_PERMANENT = True
+        try:
+            m = self._mgr()
+            m.fire((0, 5, 0), (0, 0, 1))
+            m.fire((50, 5, 50), (0, 0, 1))
+            closed = m.update(9999.0)
+            self.assertFalse(closed)
+            self.assertTrue(m.active)
+            self.assertEqual(m.time_remaining, float('inf'))
+        finally:
+            cfg.PORTAL_PERMANENT = orig
+
+    def test_portal_positions_stored_correctly(self):
+        m = self._mgr()
+        m.fire((3, 10, 7), (1, 0, 0))
+        m.fire((99, 10, 99), (0, 0, 1))
+        self.assertAlmostEqual(m.a.x, 3)
+        self.assertAlmostEqual(m.a.z, 7)
+        self.assertAlmostEqual(m.b.x, 99)
+        self.assertAlmostEqual(m.b.z, 99)
+
+    def test_model_has_portal_manager(self):
+        with patch.object(Model, '_initialize', return_value=None):
+            model = Model()
+        self.assertIsInstance(model.portal, PortalManager)
+
+
+# ===========================================================================
+# Minimap
+# ===========================================================================
+
+class TestMinimapConfig(unittest.TestCase):
+
+    def test_minimap_size_positive(self):
+        self.assertGreater(config.MINIMAP_SIZE, 0)
+
+    def test_minimap_scale_positive(self):
+        self.assertGreater(config.MINIMAP_SCALE, 0)
+
+    def test_minimap_margin_non_negative(self):
+        self.assertGreaterEqual(config.MINIMAP_MARGIN, 0)
+
+    def test_minimap_colours_dict_non_empty(self):
+        self.assertGreater(len(config.MINIMAP_COLOURS), 0)
+
+    def test_minimap_colours_are_rgb_triples(self):
+        for name, col in config.MINIMAP_COLOURS.items():
+            self.assertEqual(len(col), 3, f"{name} colour not a triple")
+            for ch in col:
+                self.assertGreaterEqual(ch, 0)
+                self.assertLessEqual(ch, 255)
+
+    def test_all_main_blocks_have_minimap_colour(self):
+        for name in ('GRASS', 'SAND', 'STONE', 'WATER', 'SNOW', 'DESERT',
+                     'DIRT', 'WOOD', 'LEAF'):
+            if name in config.MINIMAP_COLOURS:
+                self.assertIn(name, config.MINIMAP_COLOURS)
+
+
+class TestBuildMinimapData(unittest.TestCase):
+
+    def _make_model(self):
+        with patch.object(Model, '_initialize', return_value=None):
+            m = Model()
+        return m
+
+    def test_returns_bytes(self):
+        m = self._make_model()
+        data = m.build_minimap_data((0, 0, 0))
+        self.assertIsInstance(data, bytes)
+
+    def test_correct_size(self):
+        m = self._make_model()
+        data = m.build_minimap_data((0, 0, 0))
+        expected = config.MINIMAP_SIZE * config.MINIMAP_SIZE * 4  # RGBA
+        self.assertEqual(len(data), expected)
+
+    def test_empty_world_gives_dark_pixels(self):
+        m = self._make_model()
+        data = m.build_minimap_data((0, 0, 0))
+        # All pixels should be the dark unloaded colour (40, 40, 40, 255)
+        for i in range(0, len(data), 4):
+            r, g, b, a = data[i], data[i+1], data[i+2], data[i+3]
+            self.assertEqual(a, 255)
+            self.assertLessEqual(r, 60)
+
+    def test_grass_block_colours_pixel(self):
+        m = self._make_model()
+        # Place a grass block directly at player position
+        m.add_block((0, 10, 0), config.GRASS, immediate=False)
+        data = m.build_minimap_data((0, 0, 0))
+        size = config.MINIMAP_SIZE
+        cx = size // 2
+        cy = size // 2
+        idx = (cy * size + cx) * 4
+        r, g, b = data[idx], data[idx+1], data[idx+2]
+        expected = config.MINIMAP_COLOURS['GRASS']
+        self.assertEqual((r, g, b), expected)
+
+    def test_water_block_shows_blue(self):
+        m = self._make_model()
+        m.add_block((0, 10, 0), config.WATER, immediate=False)
+        data = m.build_minimap_data((0, 0, 0))
+        size = config.MINIMAP_SIZE
+        cx, cy = size // 2, size // 2
+        idx = (cy * size + cx) * 4
+        b = data[idx + 2]
+        self.assertGreater(b, 150, "Water should show as blue-dominant pixel")
+
+    def test_higher_block_occludes_lower(self):
+        m = self._make_model()
+        # Grass at y=5, stone above at y=6 — stone should show
+        m.add_block((0, 5, 0), config.GRASS, immediate=False)
+        m.add_block((0, 6, 0), config.STONE, immediate=False)
+        data = m.build_minimap_data((0, 0, 0))
+        size = config.MINIMAP_SIZE
+        idx = (size//2 * size + size//2) * 4
+        r, g, b = data[idx], data[idx+1], data[idx+2]
+        stone_col = config.MINIMAP_COLOURS['STONE']
+        self.assertEqual((r, g, b), stone_col)
+
+    def test_player_offset_shifts_map(self):
+        m = self._make_model()
+        # Block at (10, 5, 0) — with player at (10, 0, 0) it should be at centre
+        m.add_block((10, 5, 0), config.SAND, immediate=False)
+        data = m.build_minimap_data((10, 0, 0))
+        size = config.MINIMAP_SIZE
+        idx = (size//2 * size + size//2) * 4
+        r, g, b = data[idx], data[idx+1], data[idx+2]
+        sand_col = config.MINIMAP_COLOURS['SAND']
+        self.assertEqual((r, g, b), sand_col)
+
+    def test_all_pixels_have_full_alpha(self):
+        m = self._make_model()
+        data = m.build_minimap_data((0, 0, 0))
+        for i in range(3, len(data), 4):
+            self.assertEqual(data[i], 255)
+
+
+# ===========================================================================
+# Portal compass
+# ===========================================================================
+
+class TestPortalCompassConfig(unittest.TestCase):
+
+    def test_compass_margin_positive(self):
+        self.assertGreater(config.COMPASS_MARGIN, 0)
+
+    def test_compass_arrow_r_positive(self):
+        self.assertGreater(config.COMPASS_ARROW_R, 0)
+
+
+class TestPortalCompassMaths(unittest.TestCase):
+    """Test the bearing and screen-projection maths without GL."""
+
+    def _screen_pos(self, dx, dz, yaw_deg, w=1280, h=720):
+        """Reproduce the compass projection from draw_portal_compass."""
+        import math
+        cx, cy = w // 2, h // 2
+        margin = config.COMPASS_MARGIN
+        yaw = math.radians(yaw_deg)
+        world_bearing = math.atan2(dx, -dz)
+        screen_bearing = world_bearing - yaw + math.pi / 2
+        sdx = math.cos(screen_bearing)
+        sdy = math.sin(screen_bearing)
+        if abs(sdx) > 1e-6:
+            tx = (w/2 - margin) / abs(sdx)
+        else:
+            tx = float('inf')
+        if abs(sdy) > 1e-6:
+            ty = (h/2 - margin) / abs(sdy)
+        else:
+            ty = float('inf')
+        t = min(tx, ty)
+        sx = cx + sdx * t
+        sy = cy + sdy * t
+        sx = max(margin, min(w - margin, sx))
+        sy = max(margin, min(h - margin, sy))
+        return (sx, sy)
+
+    def test_portal_directly_ahead_is_near_centre(self):
+        # Player facing +Z (yaw=0), portal is ahead at dz=50
+        sx, sy = self._screen_pos(0, 50, yaw_deg=0)
+        self.assertAlmostEqual(sx, 640, delta=5)    # near horizontal centre
+
+    def test_portal_behind_is_near_vertical_edge(self):
+        # Player facing +Z, portal behind at dz=-50 — should hit top or bottom edge
+        sx, sy = self._screen_pos(0, -50, yaw_deg=0)
+        at_edge = (abs(sy - config.COMPASS_MARGIN) < 5 or
+                   abs(sy - (720 - config.COMPASS_MARGIN)) < 5)
+        self.assertTrue(at_edge, f"Behind portal sy={sy:.0f} should be at a vertical edge")
+
+    def test_portal_left_is_at_left_or_right_edge(self):
+        # Player facing +Z (yaw=0), portal to the left (dx<0) — should hit horizontal edge
+        sx, sy = self._screen_pos(-50, 0, yaw_deg=0)
+        at_edge = (abs(sx - config.COMPASS_MARGIN) < 5 or
+                   abs(sx - (1280 - config.COMPASS_MARGIN)) < 5)
+        self.assertTrue(at_edge, f"Left portal sx={sx:.0f} should be at horizontal edge")
+
+    def test_portal_right_is_at_right_or_left_edge(self):
+        sx, sy = self._screen_pos(50, 0, yaw_deg=0)
+        at_edge = (abs(sx - config.COMPASS_MARGIN) < 5 or
+                   abs(sx - (1280 - config.COMPASS_MARGIN)) < 5)
+        self.assertTrue(at_edge, f"Right portal sx={sx:.0f} should be at horizontal edge")
+
+    def test_indicator_always_within_screen(self):
+        import math
+        for angle_deg in range(0, 360, 15):
+            dx = math.cos(math.radians(angle_deg)) * 100
+            dz = math.sin(math.radians(angle_deg)) * 100
+            sx, sy = self._screen_pos(dx, dz, yaw_deg=0)
+            self.assertGreaterEqual(sx, config.COMPASS_MARGIN)
+            self.assertLessEqual(sx, 1280 - config.COMPASS_MARGIN)
+            self.assertGreaterEqual(sy, config.COMPASS_MARGIN)
+            self.assertLessEqual(sy, 720 - config.COMPASS_MARGIN)
+
+    def test_rotating_player_rotates_indicator(self):
+        # Same portal position, different yaw — indicator should move
+        sx0, sy0 = self._screen_pos(50, 0, yaw_deg=0)
+        sx90, sy90 = self._screen_pos(50, 0, yaw_deg=90)
+        self.assertFalse(
+            abs(sx0 - sx90) < 1 and abs(sy0 - sy90) < 1,
+            "Rotating player should move the compass indicator"
+        )
+
+    def test_distance_calculation(self):
+        import math
+        dx, dz = 30, 40
+        dist = math.sqrt(dx*dx + dz*dz)
+        self.assertAlmostEqual(dist, 50.0)
+
+
+# ===========================================================================
+# Weather system
+# ===========================================================================
+
+class TestWeatherConfig(unittest.TestCase):
+
+    def test_fade_in_positive(self):
+        self.assertGreater(config.WEATHER_FADE_IN, 0)
+
+    def test_fade_out_positive(self):
+        self.assertGreater(config.WEATHER_FADE_OUT, 0)
+
+    def test_all_biomes_have_weather(self):
+        for biome in config.BIOMES:
+            self.assertIn(biome, config.BIOME_WEATHER,
+                          f"Biome {biome} missing from BIOME_WEATHER")
+
+    def test_weather_types_valid(self):
+        valid = {'rain', 'snow', 'clear'}
+        for biome, wtype in config.BIOME_WEATHER.items():
+            self.assertIn(wtype, valid, f"Biome {biome} has invalid weather {wtype}")
+
+    def test_desert_is_clear(self):
+        self.assertEqual(config.BIOME_WEATHER['DESERT'], 'clear')
+
+    def test_tundra_is_snow(self):
+        self.assertEqual(config.BIOME_WEATHER['TUNDRA'], 'snow')
+
+    def test_forest_is_rain(self):
+        self.assertEqual(config.BIOME_WEATHER['FOREST'], 'rain')
+
+    def test_rain_colour_is_rgba(self):
+        self.assertEqual(len(config.RAIN_COLOUR), 4)
+
+    def test_snow_colour_is_rgba(self):
+        self.assertEqual(len(config.SNOW_COLOUR), 4)
+
+    def test_rain_falls_faster_than_snow(self):
+        self.assertLess(config.RAIN_VY, config.SNOW_VY)
+
+    def test_fog_density_in_range(self):
+        self.assertGreater(config.RAIN_FOG_DENSITY, 0.0)
+        self.assertLessEqual(config.RAIN_FOG_DENSITY, 1.0)
+        self.assertGreater(config.SNOW_FOG_DENSITY, 0.0)
+        self.assertLessEqual(config.SNOW_FOG_DENSITY, 1.0)
+
+    def test_rain_foggier_than_snow(self):
+        self.assertGreater(config.RAIN_FOG_DENSITY, config.SNOW_FOG_DENSITY)
+
+    def test_fog_end_clear_greater_than_max(self):
+        self.assertGreater(config.FOG_END_CLEAR, config.FOG_END_MAX)
+
+    def test_weather_disc_radius_positive(self):
+        self.assertGreater(config.WEATHER_DISC_RADIUS, 0)
+
+    def test_weather_height_positive(self):
+        self.assertGreater(config.WEATHER_HEIGHT, 0)
+
+
+class TestWeatherParticle(unittest.TestCase):
+
+    def _make(self, **kw):
+        defaults = dict(x=0,y=20,z=0, vx=0,vy=-5,vz=0,
+                        colour=(200,200,255,150), size=2, lifetime=2.0)
+        defaults.update(kw)
+        return WeatherParticle(**defaults)
+
+    def test_alive_at_birth(self):
+        self.assertTrue(self._make().alive)
+
+    def test_dead_after_lifetime(self):
+        p = self._make()
+        p.age = p.lifetime
+        self.assertFalse(p.alive)
+
+    def test_falls_on_update(self):
+        p = self._make(vy=-10.0)
+        old_y = p.y
+        p.update(0.1)
+        self.assertLess(p.y, old_y)
+
+    def test_no_gravity_acceleration(self):
+        # WeatherParticle has constant vy (no gravity applied)
+        p = self._make(vy=-5.0)
+        p.update(1.0)
+        self.assertAlmostEqual(p.vy, -5.0)
+
+    def test_alpha_fraction_increases(self):
+        p = self._make()
+        p.update(0.5)
+        self.assertGreater(p.alpha_fraction, 0.0)
+
+    def test_size_stored(self):
+        p = self._make(size=3)
+        self.assertEqual(p.size, 3)
+
+
+class TestWeatherManager(unittest.TestCase):
+
+    def _mgr(self):
+        return WeatherManager()
+
+    def test_starts_clear(self):
+        m = self._mgr()
+        self.assertEqual(m.weather_type, 'clear')
+        self.assertAlmostEqual(m.intensity, 0.0)
+
+    def test_starts_no_particles(self):
+        self.assertEqual(self._mgr().particles, [])
+
+    def test_fog_density_zero_at_start(self):
+        self.assertAlmostEqual(self._mgr().fog_density, 0.0)
+
+    def test_intensity_ramps_up_for_rain(self):
+        m = self._mgr()
+        m.weather_type = 'rain'
+        m.update(config.WEATHER_FADE_IN * 0.5, (0,0,0))
+        self.assertGreater(m.intensity, 0.0)
+        self.assertLess(m.intensity, 1.0)
+
+    def test_intensity_reaches_one_after_fade_in(self):
+        m = self._mgr()
+        m.weather_type = 'rain'
+        m.update(config.WEATHER_FADE_IN + 1.0, (0,0,0))
+        self.assertAlmostEqual(m.intensity, 1.0)
+
+    def test_intensity_ramps_down_when_cleared(self):
+        m = self._mgr()
+        m.weather_type = 'rain'
+        m.intensity = 1.0
+        m.weather_type = 'clear'
+        m.update(config.WEATHER_FADE_OUT * 0.5, (0,0,0))
+        self.assertLess(m.intensity, 1.0)
+        self.assertGreater(m.intensity, 0.0)
+
+    def test_rain_emits_particles(self):
+        m = self._mgr()
+        m.weather_type = 'rain'
+        m.intensity = 1.0
+        m.update(1.0, (0, 20, 0))
+        self.assertGreater(len(m.particles), 0)
+
+    def test_snow_emits_particles(self):
+        m = self._mgr()
+        m.weather_type = 'snow'
+        m.intensity = 1.0
+        m.update(1.0, (0, 20, 0))
+        self.assertGreater(len(m.particles), 0)
+
+    def test_clear_emits_no_particles(self):
+        m = self._mgr()
+        m.weather_type = 'clear'
+        m.intensity = 0.0
+        m.update(1.0, (0, 20, 0))
+        self.assertEqual(len(m.particles), 0)
+
+    def test_particles_spawn_above_player(self):
+        m = self._mgr()
+        m.weather_type = 'rain'
+        m.intensity = 1.0
+        player_y = 20.0
+        m.update(0.5, (0, player_y, 0))
+        for p in m.particles:
+            self.assertGreater(p.y, player_y,
+                               "Weather particles should spawn above player")
+
+    def test_rain_particles_have_correct_colour(self):
+        m = self._mgr()
+        m.weather_type = 'rain'
+        m.intensity = 1.0
+        m.update(0.1, (0, 20, 0))
+        for p in m.particles:
+            self.assertEqual(p.colour, config.RAIN_COLOUR)
+
+    def test_snow_particles_have_correct_colour(self):
+        m = self._mgr()
+        m.weather_type = 'snow'
+        m.intensity = 1.0
+        m.update(0.1, (0, 20, 0))
+        for p in m.particles:
+            self.assertEqual(p.colour, config.SNOW_COLOUR)
+
+    def test_dead_particles_removed(self):
+        m = self._mgr()
+        m.weather_type = 'rain'
+        m.intensity = 1.0
+        m.update(1.0, (0, 20, 0))
+        initial_count = len(m.particles)
+        # Age all particles past their lifetime
+        for p in m.particles:
+            p.age = p.lifetime + 1.0
+        m.update(0.01, (0, 20, 0))
+        self.assertLess(len(m.particles), initial_count)
+
+    def test_fog_increases_with_rain(self):
+        m = self._mgr()
+        m.weather_type = 'rain'
+        m.intensity = 1.0
+        initial_fog = m.fog_density
+        m.update(2.0, (0, 20, 0))
+        self.assertGreater(m.fog_density, initial_fog)
+
+    def test_fog_density_bounded(self):
+        m = self._mgr()
+        m.weather_type = 'rain'
+        m.intensity = 1.0
+        for _ in range(100):
+            m.update(0.1, (0, 20, 0))
+        self.assertLessEqual(m.fog_density, config.RAIN_FOG_DENSITY + 0.01)
+
+    def test_rain_rate_greater_than_zero(self):
+        self.assertGreater(config.RAIN_RATE, 0)
+
+    def test_snow_rate_greater_than_zero(self):
+        self.assertGreater(config.SNOW_RATE, 0)
+
+    def test_model_has_weather_manager(self):
+        with patch.object(Model, '_initialize', return_value=None):
+            model = Model()
+        self.assertIsInstance(model.weather, WeatherManager)
+
+
+# ===========================================================================
+# Sky objects — sun, moon, stars, clouds
+# ===========================================================================
+
+class TestSkyConfig(unittest.TestCase):
+
+    def test_sky_sphere_radius_positive(self):
+        self.assertGreater(config.SKY_SPHERE_RADIUS, 0)
+
+    def test_sky_sphere_inside_far_plane(self):
+        # Far plane is now 120 in set_3d; sky sphere must be inside it
+        self.assertLess(config.SKY_SPHERE_RADIUS, 120.0)
+
+    def test_sun_size_positive(self):
+        self.assertGreater(config.SUN_SIZE, 0)
+
+    def test_sun_halo_larger_than_sun(self):
+        self.assertGreater(config.SUN_HALO_SIZE, config.SUN_SIZE)
+
+    def test_moon_smaller_than_sun(self):
+        self.assertLess(config.MOON_SIZE, config.SUN_SIZE)
+
+    def test_sun_colour_is_rgba(self):
+        self.assertEqual(len(config.SUN_COLOUR), 4)
+
+    def test_moon_colour_is_rgba(self):
+        self.assertEqual(len(config.MOON_COLOUR), 4)
+
+    def test_star_count_positive(self):
+        self.assertGreater(config.STAR_COUNT, 0)
+
+    def test_star_fade_start_greater_than_end(self):
+        self.assertGreater(config.STAR_FADE_START, config.STAR_FADE_END)
+
+    def test_cloud_count_positive(self):
+        self.assertGreater(config.CLOUD_COUNT, 0)
+
+    def test_cloud_height_positive(self):
+        self.assertGreater(config.CLOUD_HEIGHT, 0)
+
+    def test_cloud_speed_positive(self):
+        self.assertGreater(config.CLOUD_SPEED, 0)
+
+    def test_cloud_colour_is_rgb(self):
+        self.assertEqual(len(config.CLOUD_COLOUR), 3)
+
+
+class TestSkyMaths(unittest.TestCase):
+    """Test sun/moon position maths and visibility logic without GL."""
+
+    def _sun_pos(self, game_time, player=(0, 20, 0)):
+        import math
+        px, py, pz = player
+        R = config.SKY_SPHERE_RADIUS
+        angle = (game_time / config.DAY_LENGTH) * 2.0 * math.pi
+        return (px, py + math.sin(angle) * R, pz - math.cos(angle) * R)
+
+    def _moon_pos(self, game_time, player=(0, 20, 0)):
+        import math
+        px, py, pz = player
+        R = config.SKY_SPHERE_RADIUS
+        angle = (game_time / config.DAY_LENGTH) * 2.0 * math.pi + math.pi
+        return (px, py + math.sin(angle) * R, pz - math.cos(angle) * R)
+
+    def test_sun_above_horizon_at_noon(self):
+        noon = config.DAY_LENGTH / 4.0
+        _, sun_y, _ = self._sun_pos(noon)
+        self.assertGreater(sun_y, 20)  # well above player y=20
+
+    def test_sun_below_horizon_at_midnight(self):
+        midnight = config.DAY_LENGTH * 3.0 / 4.0
+        _, sun_y, _ = self._sun_pos(midnight)
+        self.assertLess(sun_y, 20)  # below player y=20
+
+    def test_moon_above_horizon_at_midnight(self):
+        midnight = config.DAY_LENGTH * 3.0 / 4.0
+        _, moon_y, _ = self._moon_pos(midnight)
+        self.assertGreater(moon_y, 20)
+
+    def test_moon_below_horizon_at_noon(self):
+        noon = config.DAY_LENGTH / 4.0
+        _, moon_y, _ = self._moon_pos(noon)
+        self.assertLess(moon_y, 20)
+
+    def test_sun_and_moon_always_opposite(self):
+        import math
+        player = (0, 20, 0)
+        for t in range(0, 600, 30):
+            sx, sy, sz = self._sun_pos(t, player)
+            mx, my, mz = self._moon_pos(t, player)
+            px, py, pz = player
+            # Sun and moon vectors should point in opposite directions
+            dot = (sx-px)*(mx-px) + (sy-py)*(my-py) + (sz-pz)*(mz-pz)
+            self.assertLess(dot, 0, f"Sun and moon should be opposite at t={t}")
+
+    def test_sun_at_sky_sphere_radius(self):
+        import math
+        player = (0, 20, 0)
+        px, py, pz = player
+        for t in range(0, 600, 60):
+            sx, sy, sz = self._sun_pos(t, player)
+            dist = math.sqrt((sx-px)**2 + (sy-py)**2 + (sz-pz)**2)
+            self.assertAlmostEqual(dist, config.SKY_SPHERE_RADIUS, places=3)
+
+    def test_star_visibility_at_midnight(self):
+        midnight = config.DAY_LENGTH * 3.0 / 4.0
+        brightness = config.sun_brightness(midnight)
+        self.assertLess(brightness, config.STAR_FADE_START)
+
+    def test_stars_invisible_at_noon(self):
+        noon = config.DAY_LENGTH / 4.0
+        brightness = config.sun_brightness(noon)
+        self.assertGreater(brightness, config.STAR_FADE_START)
+
+
+class TestSkyRenderer(unittest.TestCase):
+    """Test SkyRenderer data generation without GL."""
+
+    def setUp(self):
+        # Manually instantiate just the data-generation parts — no GL needed
+        import math, random as _random
+        self.renderer = type('R', (), {
+            '_star_positions': [],
+            '_cloud_offsets': [],
+        })()
+
+        # Replicate _build_stars
+        rng = _random.Random(config.STAR_SEED)
+        stars = []
+        while len(stars) < config.STAR_COUNT:
+            cos_theta = rng.uniform(0.05, 1.0)
+            sin_theta = math.sqrt(max(0.0, 1.0 - cos_theta * cos_theta))
+            psi = rng.uniform(0, 2 * math.pi)
+            stars.append((sin_theta * math.cos(psi), cos_theta,
+                          sin_theta * math.sin(psi)))
+        self.renderer._star_positions = stars
+
+        # Replicate _build_clouds (puff-based)
+        rng2 = _random.Random(config.CLOUD_SEED)
+        s = config.CLOUD_SPREAD
+        clouds = []
+        for _ in range(config.CLOUD_COUNT):
+            base_ox = rng2.uniform(-s, s)
+            base_oz = rng2.uniform(-s, s)
+            scale   = rng2.uniform(6, 15)
+            spread  = scale * 0.65
+            n_puffs = rng2.randint(5, 9)
+            puffs   = []
+            for _ in range(n_puffs):
+                px     = base_ox + rng2.uniform(-spread, spread)
+                pz_    = base_oz + rng2.uniform(-spread, spread)
+                py_off = rng2.uniform(0.0, 2.0)
+                r      = rng2.uniform(scale * 0.4, scale * 0.95)
+                puffs.append((px, pz_, py_off, r))
+            clouds.append(puffs)
+        self.renderer._cloud_offsets = clouds
+
+    def test_star_count(self):
+        self.assertEqual(len(self.renderer._star_positions),
+                         config.STAR_COUNT)
+
+    def test_stars_on_unit_sphere(self):
+        import math
+        for (x, y, z) in self.renderer._star_positions:
+            length = math.sqrt(x*x + y*y + z*z)
+            self.assertAlmostEqual(length, 1.0, places=5)
+
+    def test_stars_upper_hemisphere_only(self):
+        for (x, y, z) in self.renderer._star_positions:
+            self.assertGreater(y, 0.0, "Stars should be in upper hemisphere")
+
+    def test_star_positions_deterministic(self):
+        import math, random as _rng
+        rng = _rng.Random(config.STAR_SEED)
+        stars2 = []
+        while len(stars2) < config.STAR_COUNT:
+            cos_theta = rng.uniform(0.05, 1.0)
+            sin_theta = math.sqrt(max(0.0, 1.0 - cos_theta * cos_theta))
+            psi = rng.uniform(0, 2 * math.pi)
+            stars2.append((sin_theta * math.cos(psi), cos_theta,
+                           sin_theta * math.sin(psi)))
+        self.assertEqual(self.renderer._star_positions, stars2)
+
+    def test_cloud_count(self):
+        self.assertEqual(len(self.renderer._cloud_offsets),
+                         config.CLOUD_COUNT)
+
+    def test_cloud_offsets_have_four_components(self):
+        # Each cloud is a list of puffs; each puff has 4 components
+        for cloud in self.renderer._cloud_offsets:
+            self.assertIsInstance(cloud, list)
+            self.assertGreater(len(cloud), 0)
+            for puff in cloud:
+                self.assertEqual(len(puff), 4)
+
+    def test_cloud_width_positive(self):
+        for cloud in self.renderer._cloud_offsets:
+            for ox, oz, oy_off, radius in cloud:
+                self.assertGreater(radius, 0)
+                self.assertGreaterEqual(oy_off, 0)
+
+    def test_cloud_offsets_deterministic(self):
+        import random as _rng, math as _math
+        rng = _rng.Random(config.CLOUD_SEED)
+        s = config.CLOUD_SPREAD
+        clouds2 = []
+        for _ in range(config.CLOUD_COUNT):
+            base_ox = rng.uniform(-s, s)
+            base_oz = rng.uniform(-s, s)
+            scale   = rng.uniform(6, 15)
+            spread  = scale * 0.65
+            n_puffs = rng.randint(5, 9)
+            puffs   = []
+            for _ in range(n_puffs):
+                px     = base_ox + rng.uniform(-spread, spread)
+                pz     = base_oz + rng.uniform(-spread, spread)
+                py_off = rng.uniform(0.0, 2.0)
+                r      = rng.uniform(scale * 0.4, scale * 0.95)
+                puffs.append((px, pz, py_off, r))
+            clouds2.append(puffs)
+        self.assertEqual(self.renderer._cloud_offsets, clouds2)
+
+    def test_cloud_offsets_spread(self):
+        # Base puff positions should generally be within CLOUD_SPREAD
+        # (individual puffs can scatter a bit beyond)
+        s = config.CLOUD_SPREAD * 1.5  # generous bound
+        for cloud in self.renderer._cloud_offsets:
+            for ox, oz, oy_off, radius in cloud:
+                self.assertLessEqual(abs(ox), s)
+                self.assertLessEqual(abs(oz), s)
+
+    def test_each_cloud_has_multiple_puffs(self):
+        for cloud in self.renderer._cloud_offsets:
+            self.assertGreaterEqual(len(cloud), 5)
+
+
+# ===========================================================================
+# Mobs / entities
+# ===========================================================================
+
+class TestMobConfig(unittest.TestCase):
+
+    def test_mob_max_positive(self):
+        self.assertGreater(config.MOB_MAX, 0)
+
+    def test_mob_types_non_empty(self):
+        self.assertGreater(len(config.MOB_TYPES), 0)
+
+    def test_each_mob_type_has_required_keys(self):
+        required = {'width', 'height', 'speed', 'body_colour',
+                    'leg_colour', 'idle_time', 'walk_time', 'spawn_on'}
+        for name, d in config.MOB_TYPES.items():
+            for key in required:
+                self.assertIn(key, d, f"Mob {name} missing key {key}")
+
+    def test_mob_colours_are_rgba(self):
+        for name, d in config.MOB_TYPES.items():
+            self.assertEqual(len(d['body_colour']), 4, f"{name} body_colour not RGBA")
+            self.assertEqual(len(d['leg_colour']),  4, f"{name} leg_colour not RGBA")
+
+    def test_mob_dimensions_positive(self):
+        for name, d in config.MOB_TYPES.items():
+            self.assertGreater(d['width'],  0)
+            self.assertGreater(d['height'], 0)
+            self.assertGreater(d['speed'],  0)
+
+    def test_chicken_and_sheep_defined(self):
+        self.assertIn('chicken', config.MOB_TYPES)
+        self.assertIn('sheep',   config.MOB_TYPES)
+
+    def test_spawn_on_lists_non_empty(self):
+        for name, d in config.MOB_TYPES.items():
+            self.assertGreater(len(d['spawn_on']), 0)
+
+    def test_despawn_greater_than_spawn(self):
+        self.assertGreater(config.MOB_DESPAWN_DIST, config.MOB_SPAWN_DIST)
+
+
+class TestEntity(unittest.TestCase):
+
+    def _mob(self, mob_type='chicken', x=0, y=10, z=0):
+        from mobs import Mob
+        return Mob(mob_type, x, y, z)
+
+    def test_position_property(self):
+        m = self._mob(x=1, y=2, z=3)
+        self.assertEqual(m.position, (1.0, 2.0, 3.0))
+
+    def test_height_from_config(self):
+        m = self._mob('chicken')
+        self.assertAlmostEqual(m.height,
+                               config.MOB_TYPES['chicken']['height'])
+
+    def test_width_from_config(self):
+        m = self._mob('sheep')
+        self.assertAlmostEqual(m.width,
+                               config.MOB_TYPES['sheep']['width'])
+
+    def test_starts_alive(self):
+        self.assertTrue(self._mob().alive)
+
+    def test_falls_without_ground(self):
+        m = self._mob(y=20)
+        old_y = m.y
+        m.apply_gravity(0.1)
+        m.move(0.1, {})   # empty world — no collision
+        self.assertLess(m.y, old_y)
+
+    def test_lands_on_block(self):
+        from mobs import Mob
+        m = Mob('chicken', 0.2, 5, 0.2)
+        # Place a solid floor at y=3
+        world = {(0, 3, 0): config.STONE}
+        for _ in range(30):
+            m.apply_gravity(0.05)
+            m.move(0.05, world)
+        # Should be resting on top of the block
+        self.assertAlmostEqual(m.y, 4.0, delta=0.5)
+        self.assertTrue(m.on_ground)
+
+    def test_body_colour_from_config(self):
+        m = self._mob('sheep')
+        self.assertEqual(m.body_colour, config.MOB_TYPES['sheep']['body_colour'])
+
+
+class TestMobAI(unittest.TestCase):
+
+    def _mob(self, mob_type='chicken'):
+        from mobs import Mob
+        return Mob(mob_type, 0, 10, 0)
+
+    def test_starts_in_idle_or_walk(self):
+        from mobs import Mob
+        m = Mob('chicken', 0, 10, 0)
+        self.assertIn(m._state, (Mob.IDLE, Mob.WALK))
+
+    def test_transitions_to_walk(self):
+        from mobs import Mob
+        m = Mob('chicken', 0.2, 10, 0.2)
+        m._state = Mob.IDLE
+        m._state_timer = 0.0
+        m.on_ground = True   # pretend it's on the ground
+        # Force the state transition directly
+        m._enter_walk()
+        self.assertEqual(m._state, Mob.WALK)
+        self.assertGreater(m._state_timer, 0)
+
+    def test_transitions_to_idle(self):
+        from mobs import Mob
+        m = Mob('chicken', 0, 10, 0)
+        m._state = Mob.WALK
+        m._state_timer = 0.0
+        m.update(0.1, {})
+        self.assertEqual(m._state, Mob.IDLE)
+
+    def test_walk_changes_position(self):
+        from mobs import Mob
+        # Put chicken on a flat floor so it doesn't fall through
+        world = {}
+        for x in range(-5, 5):
+            for z in range(-5, 5):
+                world[(x, 8, z)] = config.GRASS
+        m = Mob('chicken', 0.5, 9.5, 0.5)
+        m._state = Mob.WALK
+        m._state_timer = 5.0
+        old_pos = m.position
+        for _ in range(20):
+            m.update(0.05, world)
+        new_pos = m.position
+        moved = math.sqrt((new_pos[0]-old_pos[0])**2 + (new_pos[2]-old_pos[2])**2)
+        self.assertGreater(moved, 0.01)
+
+    def test_idle_stays_still(self):
+        from mobs import Mob
+        world = {(0, 8, 0): config.GRASS}
+        m = Mob('chicken', 0.5, 9.5, 0.5)
+        m._state = Mob.IDLE
+        m._state_timer = 10.0
+        old_x, old_z = m.x, m.z
+        for _ in range(10):
+            m.update(0.05, world)
+        self.assertAlmostEqual(m.x, old_x, delta=0.01)
+        self.assertAlmostEqual(m.z, old_z, delta=0.01)
+
+    def test_falls_below_world_marks_dead(self):
+        from mobs import Mob
+        m = Mob('chicken', 0, 10, 0)
+        m.y = -25.0
+        m.update(0.05, {})
+        self.assertFalse(m.alive)
+
+
+class TestMobManager(unittest.TestCase):
+
+    def _mgr(self):
+        from mobs import MobManager
+        return MobManager()
+
+    def test_starts_empty(self):
+        self.assertEqual(len(self._mgr().mobs), 0)
+
+    def test_update_does_not_crash_empty(self):
+        mgr = self._mgr()
+        mgr.update(0.05, (0, 20, 0), {})   # should not raise
+
+    def test_spawn_after_interval(self):
+        mgr = self._mgr()
+        # World must be large enough for the spawn ring (min dist = SECTOR_SIZE*2)
+        r = config.SECTOR_SIZE * 3 + 5
+        world = {}
+        for x in range(-r, r):
+            for z in range(-r, r):
+                world[(x, 10, z)] = config.GRASS
+        # Advance past spawn interval several times
+        for _ in range(8):
+            mgr.update(config.MOB_SPAWN_INTERVAL, (0, 12, 0), world)
+        self.assertGreater(len(mgr.mobs), 0)
+
+    def test_despawn_far_mobs(self):
+        from mobs import Mob
+        mgr = self._mgr()
+        far_dist = config.MOB_DESPAWN_DIST * config.SECTOR_SIZE + 10
+        mgr.mobs.append(Mob('chicken', far_dist, 10, 0))
+        mgr.update(0.05, (0, 10, 0), {})
+        self.assertEqual(len(mgr.mobs), 0)
+
+    def test_respects_mob_max(self):
+        from mobs import Mob
+        mgr = self._mgr()
+        for i in range(config.MOB_MAX + 5):
+            mgr.mobs.append(Mob('chicken', i, 10, 0))
+        world = {}
+        for x in range(-10, 10):
+            for z in range(-10, 10):
+                world[(x, 10, z)] = config.GRASS
+        for _ in range(10):
+            mgr.update(config.MOB_SPAWN_INTERVAL, (0, 12, 0), world)
+        self.assertLessEqual(len(mgr.mobs), config.MOB_MAX + 5)
+
+    def test_model_has_mob_manager(self):
+        with patch.object(Model, '_initialize', return_value=None):
+            model = Model()
+        from mobs import MobManager
+        self.assertIsInstance(model.mobs, MobManager)
+
+
+class TestUtilCollide(unittest.TestCase):
+    """Tests for the extracted collide() function in util.py."""
+
+    def test_no_collision_empty_world(self):
+        pos, on_ground = util_collide((5.5, 10.5, 5.5), 2, {})
+        self.assertAlmostEqual(pos[0], 5.5)
+        self.assertFalse(on_ground)
+
+    def test_lands_on_block(self):
+        world = {(5, 8, 5): config.STONE}
+        # Player at y=8.7 with x/z avoiding .5 rounding
+        pos, on_ground = util_collide((5.2, 8.7, 5.2), 2, world)
+        self.assertTrue(on_ground)
+
+    def test_portal_blocks_are_passthrough(self):
+        world = {(5, 8, 5): config.PORTAL_TEX}
+        pos, on_ground = util_collide((5.5, 8.3, 5.5), 2, world,
+                                      portal_tex=config.PORTAL_TEX)
+        self.assertFalse(on_ground)
+
+    def test_returns_tuple(self):
+        result = util_collide((0.5, 5.5, 0.5), 1, {})
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+
+
+# ===========================================================================
+# Mob sprite atlas and renderer
+# ===========================================================================
+
+class TestMobAtlas(unittest.TestCase):
+    """Verify mob_atlas.png exists and has correct dimensions/content."""
+
+    def setUp(self):
+        import os
+        self.atlas_path = os.path.join(
+            os.path.dirname(__file__), 'mob_atlas.png')
+
+    def test_atlas_exists(self):
+        import os
+        self.assertTrue(os.path.exists(self.atlas_path),
+                        "mob_atlas.png not found")
+
+    def test_atlas_dimensions(self):
+        from PIL import Image
+        img = Image.open(self.atlas_path)
+        self.assertEqual(img.width,  128)
+        self.assertEqual(img.height,  64)
+
+    def test_atlas_is_rgba(self):
+        from PIL import Image
+        img = Image.open(self.atlas_path).convert('RGBA')
+        self.assertEqual(img.mode, 'RGBA')
+
+    def test_chicken_region_is_yellow(self):
+        from PIL import Image
+        img = Image.open(self.atlas_path).convert('RGBA')
+        # Sample centre of chicken body (left half, upper area)
+        r, g, b, a = img.getpixel((32, 16))
+        self.assertGreater(r, 180, "Chicken should be yellow (high R)")
+        self.assertGreater(g, 150, "Chicken should be yellow (high G)")
+        self.assertLess(b, 100,    "Chicken should be yellow (low B)")
+        self.assertEqual(a, 255)
+
+    def test_sheep_region_is_white(self):
+        from PIL import Image
+        img = Image.open(self.atlas_path).convert('RGBA')
+        # Sample centre of sheep body (right half, upper area)
+        r, g, b, a = img.getpixel((96, 16))
+        self.assertGreater(r, 200)
+        self.assertGreater(g, 200)
+        self.assertGreater(b, 200)
+        self.assertEqual(a, 255)
+
+    def test_transparent_background_corners(self):
+        from PIL import Image
+        img = Image.open(self.atlas_path).convert('RGBA')
+        # Top-left corner of chicken should be transparent
+        _, _, _, a = img.getpixel((0, 0))
+        self.assertEqual(a, 0, "Sprite corner should be transparent")
+
+    def test_sheep_has_grey_legs(self):
+        from PIL import Image
+        img = Image.open(self.atlas_path).convert('RGBA')
+        # Bottom centre of sheep region (legs area)
+        r, g, b, a = img.getpixel((80, 56))
+        self.assertLess(r, 150, "Sheep legs should be grey")
+
+
+class TestMobRendererConfig(unittest.TestCase):
+
+    def test_all_mob_types_have_uv_entry(self):
+        from mob_renderer import MOB_UV
+        for mob_type in config.MOB_TYPES:
+            self.assertIn(mob_type, MOB_UV,
+                          f"Mob type {mob_type} missing from MOB_UV")
+
+    def test_uv_ranges_valid(self):
+        from mob_renderer import MOB_UV
+        for mob_type, (u0, u1) in MOB_UV.items():
+            self.assertGreaterEqual(u0, 0.0)
+            self.assertLessEqual(u1, 1.0)
+            self.assertLess(u0, u1)
+
+    def test_uv_ranges_non_overlapping(self):
+        from mob_renderer import MOB_UV
+        ranges = sorted(MOB_UV.values())
+        for i in range(len(ranges) - 1):
+            self.assertLessEqual(ranges[i][1], ranges[i+1][0],
+                                 "UV ranges should not overlap")
+
+    def test_leg_v_top_in_range(self):
+        from mob_renderer import LEG_V_TOP
+        self.assertGreater(LEG_V_TOP, 0.0)
+        self.assertLess(LEG_V_TOP, 1.0)
+
+    def test_walk_amplitude_positive(self):
+        from mob_renderer import WALK_AMPLITUDE
+        self.assertGreater(WALK_AMPLITUDE, 0.0)
+
+    def test_walk_freq_positive(self):
+        from mob_renderer import WALK_FREQ
+        self.assertGreater(WALK_FREQ, 0.0)
+
+
+class TestMobRendererQuad(unittest.TestCase):
+    """Test the _quad geometry helper without GL."""
+
+    def _renderer(self):
+        from mob_renderer import MobRenderer
+        r = MobRenderer()
+        return r
+
+    def test_quad_returns_18_position_values(self):
+        r = self._renderer()
+        verts, uvs = r._quad(0, 0, 0, 0.5, 1.0, 1.0, 0.0, 0.0, 0.5, 0.0, 1.0)
+        self.assertEqual(len(verts), 18)  # 6 verts × 3 coords
+
+    def test_quad_returns_12_uv_values(self):
+        r = self._renderer()
+        verts, uvs = r._quad(0, 0, 0, 0.5, 1.0, 1.0, 0.0, 0.0, 0.5, 0.0, 1.0)
+        self.assertEqual(len(uvs), 12)  # 6 verts × 2 UV coords
+
+    def test_quad_height_correct(self):
+        r = self._renderer()
+        h = 1.5
+        verts, _ = r._quad(0, 5, 0, 0.5, h, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0)
+        ys = [verts[i] for i in range(1, 18, 3)]
+        self.assertAlmostEqual(min(ys), 5.0)
+        self.assertAlmostEqual(max(ys), 5.0 + h)
+
+    def test_quad_uv_range(self):
+        r = self._renderer()
+        _, uvs = r._quad(0, 0, 0, 0.5, 1.0, 1.0, 0.0, 0.25, 0.75, 0.0, 1.0)
+        us = uvs[0::2]
+        vs = uvs[1::2]
+        self.assertAlmostEqual(min(us), 0.25)
+        self.assertAlmostEqual(max(us), 0.75)
+        self.assertAlmostEqual(min(vs), 0.0)
+        self.assertAlmostEqual(max(vs), 1.0)

@@ -144,3 +144,41 @@ def sectorize(position, sector_size):
     x, y, z = normalize(position)
     x, y, z = x // sector_size, y // sector_size, z // sector_size
     return (x, 0, z)
+
+
+def collide(position, height, world, portal_tex=None):
+    """AABB collision against the world dict.
+
+    Extracted from Window.collide() so it can be shared by both the
+    player controller and mob entities without a Window dependency.
+
+    Returns (new_position, on_ground) where on_ground is True if the
+    entity is resting on a solid block.
+    """
+    pad = 0.25
+    p   = list(position)
+    np  = normalize(position)
+    on_ground = False
+
+    for face in config.FACES:
+        for i in range(3):
+            if not face[i]:
+                continue
+            d = (p[i] - np[i]) * face[i]
+            if d < pad:
+                continue
+            for dy in range(int(height) + 1):
+                op = list(np)
+                op[1] -= dy
+                op[i] += face[i]
+                pos_key = tuple(op)
+                if pos_key not in world:
+                    continue
+                if portal_tex is not None and world[pos_key] == portal_tex:
+                    continue   # portal blocks are walk-through
+                p[i] -= (d - pad) * face[i]
+                if face == (0, -1, 0):
+                    on_ground = True
+                break
+
+    return tuple(p), on_ground

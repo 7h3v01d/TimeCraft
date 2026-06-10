@@ -60,6 +60,7 @@ MAGIC_WATER = tex_coords((1, 3), (1, 3), (1, 3))  # Glowing water
 
 DIRT = tex_coords((0, 1), (0, 1), (0, 1))        # atlas (0,1) - reuses dirt face
 SNOW = tex_coords((3, 3), (0, 1), (2, 1))         # atlas (3,3) snow top, dirt bottom, stone sides
+PORTAL_TEX = tex_coords((2, 3), (2, 3), (2, 3))   # atlas (2,3) — portal vortex (all faces same)
 GLASS = tex_coords((1, 2), (1, 2), (1, 2))        # atlas (1,2)
 PLANKS = tex_coords((2, 2), (2, 2), (2, 2))       # atlas (2,2)
 GRAVEL = tex_coords((3, 2), (3, 2), (3, 2))       # atlas (3,2)
@@ -155,6 +156,7 @@ def _build_atlas_cell_map():
         (GLASS,        (1, 2)),
         (PLANKS,       (2, 2)),
         (GRAVEL,       (3, 2)),
+        (PORTAL_TEX,   (2, 3)),
     ]
     for tex, cell in pairs:
         TEXTURE_ATLAS_CELL[tuple(tex)] = cell
@@ -272,14 +274,14 @@ SAVE_VERSION = 1         # bumped if format changes incompatibly
 BLOCK_IDS = [
     'GRASS', 'SAND', 'BRICK', 'STONE', 'WOOD', 'LEAF',
     'WATER', 'CRYSTAL', 'MAGIC_WATER', 'DIRT', 'SNOW',
-    'GLASS', 'PLANKS', 'GRAVEL',
+    'GLASS', 'PLANKS', 'GRAVEL', 'PORTAL_TEX',
 ]
 
 # ---------------------------------------------------------------------------
 # Infinite world / chunk system
 # ---------------------------------------------------------------------------
-RENDER_DISTANCE = 4   # sectors around player to keep shown (radius)
-EVICT_DISTANCE  = 6   # sectors beyond which blocks are unloaded from world dict
+RENDER_DISTANCE = 6   # sectors around player to keep shown (radius)
+EVICT_DISTANCE  = 9   # sectors beyond which blocks are unloaded from world dict
 
 # ---------------------------------------------------------------------------
 # Biome system
@@ -392,3 +394,165 @@ def _build_sound_map():
 
 
 _build_sound_map()
+
+# ---------------------------------------------------------------------------
+# Wormhole gun / portal system
+# ---------------------------------------------------------------------------
+PORTAL_PERMANENT  = False   # True = portals stay open forever; False = timed
+PORTAL_DURATION   = 30.0    # seconds before a timed portal closes (if not permanent)
+PORTAL_COOLDOWN   = 0.8     # seconds after teleport before re-triggering
+PORTAL_REACH      = 24      # max block distance for portal placement (longer than block place)
+
+# Colours (RGBA) — A=blue, B=orange
+PORTAL_COLOR_A = (80,  160, 255, 200)
+PORTAL_COLOR_B = (255, 140,  40, 200)
+
+# Portal visual dimensions (world units)
+PORTAL_HALF_WIDTH  = 0.52   # slightly wider than one block
+PORTAL_HALF_HEIGHT = 1.05   # slightly taller than two blocks
+
+# Teleport trigger: horizontal (XZ) distance only — portal is 2 blocks tall
+# so we ignore Y and just check if the player is close enough in XZ
+PORTAL_TRIGGER_DIST_XZ = 1.2
+
+# ---------------------------------------------------------------------------
+# Minimap
+# ---------------------------------------------------------------------------
+MINIMAP_SIZE      = 120    # screen pixels square
+MINIMAP_SCALE     = 1      # world blocks per minimap pixel (1 = most zoomed in)
+MINIMAP_MARGIN    = 12     # pixels from screen edge
+MINIMAP_ALPHA     = 210    # background transparency
+MINIMAP_REFRESH   = 0.5    # seconds between minimap rebuilds
+
+# Top-surface colour per block type (RGB) for minimap rendering
+MINIMAP_COLOURS = {
+    'GRASS':      (80,  140,  50),
+    'SNOW':       (220, 235, 255),
+    'SAND':       (210, 185, 110),
+    'GRAVEL':     (140, 135, 120),
+    'STONE':      (120, 120, 120),
+    'BRICK':      (160,  80,  60),
+    'DIRT':       (101,  67,  33),
+    'WOOD':       (139,  90,  43),
+    'LEAF':       ( 40, 100,  40),
+    'PLANKS':     (160, 120,  60),
+    'WATER':      ( 50, 100, 200),
+    'MAGIC_WATER':(80,   50, 200),
+    'CRYSTAL':    (180, 140, 240),
+    'GLASS':      (160, 210, 240),
+    'PORTAL_TEX': ( 80, 160, 255),
+}
+
+# ---------------------------------------------------------------------------
+# Portal compass
+# ---------------------------------------------------------------------------
+COMPASS_MARGIN    = 44     # pixels from screen edge for screen-edge arrows
+COMPASS_ARROW_R   = 14     # radius of the circular arrow indicator
+
+# ---------------------------------------------------------------------------
+# Weather system
+# ---------------------------------------------------------------------------
+WEATHER_FADE_IN   = 8.0    # seconds to ramp from 0 → full intensity
+WEATHER_FADE_OUT  = 6.0    # seconds to ramp from full → 0
+WEATHER_CHECK_INTERVAL = 4.0  # seconds between biome re-checks
+
+# Biome → weather type ('rain', 'snow', or 'clear')
+BIOME_WEATHER = {
+    'TUNDRA':  'snow',
+    'TAIGA':   'snow',
+    'PLAINS':  'rain',
+    'FOREST':  'rain',
+    'SAVANNA': 'rain',
+    'DESERT':  'clear',
+}
+
+# Rain particle properties
+RAIN_RATE     = 80      # particles per second at full intensity
+RAIN_COLOUR   = (160, 185, 220, 100)
+RAIN_VY       = -16.0   # fast downward
+RAIN_DRIFT    = 0.6     # horizontal drift magnitude
+RAIN_LIFETIME = 1.5
+RAIN_SIZE     = 2       # pixels
+
+# Snow particle properties
+SNOW_RATE     = 45      # particles per second at full intensity
+SNOW_COLOUR   = (235, 245, 255, 200)
+SNOW_VY       = -2.0    # slow fall
+SNOW_DRIFT    = 0.8
+SNOW_LIFETIME = 5.0
+SNOW_SIZE     = 3       # pixels
+
+# Shared emission geometry
+WEATHER_DISC_RADIUS = 28   # horizontal spread of emitter disc (blocks)
+WEATHER_HEIGHT      = 18   # blocks above player where particles spawn
+
+# Fog: pushed into both shaders as fog_density (0.0=clear, 1.0=max)
+# The shader uses this to linearly shrink the far-fog distance
+RAIN_FOG_DENSITY  = 0.72
+SNOW_FOG_DENSITY  = 0.45
+FOG_START         = 12.0   # blocks from camera where fog begins
+FOG_END_CLEAR     = 105.0  # far fog distance when clear
+FOG_END_MAX       = 18.0   # far fog distance at full weather intensity
+
+# ---------------------------------------------------------------------------
+# Sky objects — sun, moon, stars, clouds
+# ---------------------------------------------------------------------------
+SKY_SPHERE_RADIUS = 110.0  # world units — inside far plane (120)
+
+# Sun
+SUN_SIZE      = 3.5        # half-width of sun disc (world units)
+SUN_COLOUR    = (255, 240, 160, 255)   # warm yellow-white
+SUN_HALO_SIZE = 5.5        # outer glow quad (lighter, alpha blended)
+
+# Moon
+MOON_SIZE     = 2.2
+MOON_COLOUR   = (210, 220, 255, 220)   # cool silver-white
+
+# Stars
+STAR_COUNT    = 200
+STAR_SIZE     = 0.18       # world units
+STAR_SEED     = 42
+STAR_FADE_START = 0.35     # sun_brightness threshold where stars start appearing
+STAR_FADE_END   = 0.12     # fully visible below this brightness
+
+# Clouds
+CLOUD_COUNT      = 28
+CLOUD_HEIGHT     = 40.0    # blocks above player
+CLOUD_SPEED      = 1.8     # blocks per second drift (along +X)
+CLOUD_SEED       = 77
+CLOUD_ALPHA_BASE = 190     # max alpha at full cloud cover
+CLOUD_COLOUR     = (240, 245, 250)   # near-white
+CLOUD_SPREAD     = 90      # placement radius around player spawn
+
+# ---------------------------------------------------------------------------
+# Mobs / entities
+# ---------------------------------------------------------------------------
+MOB_MAX          = 12     # max active mobs in the world
+MOB_SPAWN_DIST   = 2      # sectors from player to try spawning (max)
+MOB_DESPAWN_DIST = 6      # sectors from player to despawn
+MOB_SPAWN_INTERVAL = 2.0  # seconds between spawn attempts
+MOB_PHYSICS_RATE   = 3    # run mob physics every N frames (performance)
+
+# Mob type definitions
+MOB_TYPES = {
+    'chicken': {
+        'width':       0.5,
+        'height':      0.7,
+        'speed':       1.8,
+        'body_colour': (240, 200,  50, 255),   # yellow
+        'leg_colour':  (220, 120,  20, 255),   # orange
+        'idle_time':   (0.5, 1.5),
+        'walk_time':   (2.0, 5.0),
+        'spawn_on':    ('GRASS', 'SAND'),
+    },
+    'sheep': {
+        'width':       0.8,
+        'height':      1.2,
+        'speed':       1.2,
+        'body_colour': (230, 235, 235, 255),   # white
+        'leg_colour':  (100,  95,  90, 255),   # grey
+        'idle_time':   (0.8, 2.0),
+        'walk_time':   (2.0, 6.0),
+        'spawn_on':    ('GRASS', 'SNOW'),
+    },
+}
