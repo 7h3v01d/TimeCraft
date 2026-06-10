@@ -7,7 +7,7 @@ from pyglet.window import key, mouse
 from pyglet.math import Mat4, Vec3
 import config
 from model import Model
-from util import sectorize, cube_vertices, normalize
+from util import sectorize, normalize
 
 
 class Window(pyglet.window.Window):
@@ -45,8 +45,8 @@ class Window(pyglet.window.Window):
         self._status_message = ''
         self._status_timer = 0.0
         self._hotbar_batch = None
-        self._hotbar_slot_shapes = []   # background rects + border rects
-        self._hotbar_sprites = []       # one Sprite per slot (texture icon)
+        self._hotbar_slot_shapes = []
+        self._hotbar_sprites = []
         self._build_hotbar()
         pyglet.clock.schedule_interval(self.update, 1.0 / config.TICKS_PER_SEC)
 

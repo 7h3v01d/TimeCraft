@@ -33,11 +33,6 @@ class NoiseGen:
         floorX = float(int(x))
         floorZ = float(int(z))
 
-        s = 0.0,
-        t = 0.0,
-        u = 0.0,
-        v = 0.0;#Integer declaration
-
         s = self._getNoise(floorX,      floorZ)
         t = self._getNoise(floorX + 1,  floorZ)
         u = self._getNoise(floorX,      floorZ + 1)
@@ -62,3 +57,21 @@ class NoiseGen:
         result = (((totalValue / 2.1) + 1.2) * self.noiseParams.amplitude) + self.noiseParams.heightOffset
 
         return (totalValue / 5) + self.noiseParams.heightOffset
+
+    def get_climate(self, x, z, smoothness):
+        """Return a climate value in approximately [-1, 1].
+
+        Uses 3 octaves of low-frequency noise for broad, slowly-varying
+        climate regions.  The same engine as getHeight but normalised to
+        a centred range suitable for biome classification.
+        """
+        total   = 0.0
+        max_amp = 0.0
+        octaves = 3
+        for a in range(octaves):
+            freq = math.pow(2.0, a)
+            amp  = math.pow(0.5, a)
+            total   += self._noise(x * freq / smoothness,
+                                   z * freq / smoothness) * amp
+            max_amp += amp
+        return max(-1.0, min(1.0, total / max_amp))

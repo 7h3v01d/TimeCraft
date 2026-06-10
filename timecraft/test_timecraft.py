@@ -8,6 +8,8 @@ import sys
 import os
 import math
 import types
+import wave
+import struct
 import random
 import unittest
 from unittest.mock import MagicMock, patch
@@ -86,11 +88,19 @@ def _make_pyglet_stub():
     shapes_mod.Rectangle = _FakeRect
     shapes_mod.Line = _FakeLine
 
+    # pyglet.media
+    media_mod = types.ModuleType("pyglet.media")
+    class _FakeSource:
+        def play(self): pass
+    media_mod.load = MagicMock(return_value=_FakeSource())
+    media_mod.StaticSource = _FakeSource
+
     # pyglet.clock / app
     clock_mod = types.ModuleType("pyglet.clock")
     clock_mod.schedule_interval = MagicMock()
     app_mod = types.ModuleType("pyglet.app")
 
+    pyglet.media = media_mod
     pyglet.graphics = graphics
     pyglet.gl = gl
     pyglet.image = image_mod
@@ -100,6 +110,7 @@ def _make_pyglet_stub():
     pyglet.app = app_mod
 
     sys.modules["pyglet"] = pyglet
+    sys.modules["pyglet.media"] = media_mod
     sys.modules["pyglet.graphics"] = graphics
     sys.modules["pyglet.graphics.shader"] = shader_mod
     sys.modules["pyglet.gl"] = gl
@@ -1911,7 +1922,9 @@ class TestGenerateChunk(unittest.TestCase):
         with patch.object(Model, '_initialize', return_value=None):
             m = Model()
         m.seed = 42
-        m._gen = __import__('noise_gen').NoiseGen(42)
+        m._gen       = __import__('noise_gen').NoiseGen(42)
+        m._temp_gen  = __import__('noise_gen').NoiseGen(42 + config.BIOME_TEMP_SEED_OFFSET)
+        m._moist_gen = __import__('noise_gen').NoiseGen(42 + config.BIOME_MOIST_SEED_OFFSET)
         return m
 
     def test_generate_chunk_adds_blocks(self):
@@ -1993,14 +2006,19 @@ class TestGenerateChunk(unittest.TestCase):
         self.assertEqual(set(m1.world.keys()), set(m2.world.keys()))
 
     def test_different_seeds_give_different_terrain(self):
+        import noise_gen as ng
         with patch.object(Model, '_initialize', return_value=None):
             m1 = Model()
         m1.seed = 1
-        m1._gen = __import__('noise_gen').NoiseGen(1)
+        m1._gen       = ng.NoiseGen(1)
+        m1._temp_gen  = ng.NoiseGen(1 + config.BIOME_TEMP_SEED_OFFSET)
+        m1._moist_gen = ng.NoiseGen(1 + config.BIOME_MOIST_SEED_OFFSET)
         with patch.object(Model, '_initialize', return_value=None):
             m2 = Model()
         m2.seed = 999999
-        m2._gen = __import__('noise_gen').NoiseGen(999999)
+        m2._gen       = ng.NoiseGen(999999)
+        m2._temp_gen  = ng.NoiseGen(999999 + config.BIOME_TEMP_SEED_OFFSET)
+        m2._moist_gen = ng.NoiseGen(999999 + config.BIOME_MOIST_SEED_OFFSET)
         m1.generate_chunk(0, 0)
         m2.generate_chunk(0, 0)
         self.assertNotEqual(set(m1.world.keys()), set(m2.world.keys()))
@@ -2038,3 +2056,495 @@ class TestEviction(unittest.TestCase):
         m._evict_sector((0, 0, 0))
         # Flag should still be set so we don't re-terrain the chunk
         self.assertIn((0, 0), m.generated_chunks)
+
+
+# ===========================================================================
+# Biome system
+# ===========================================================================
+
+class TestClassifyBiome(unittest.TestCase):
+    """Unit tests for config.classify_biome() — pure function, no GL."""
+
+    def test_cold_dry_is_tundra(self):
+        self.assertEqual(config.classify_biome(-0.5, -0.5), 'TUNDRA')
+
+    def test_cold_wet_is_taiga(self):
+        self.assertEqual(config.classify_biome(-0.5, 0.5), 'TAIGA')
+
+    def test_temperate_dry_is_plains(self):
+        self.assertEqual(config.classify_biome(0.1, -0.5), 'PLAINS')
+
+    def test_temperate_wet_is_forest(self):
+        self.assertEqual(config.classify_biome(0.1, 0.5), 'FOREST')
+
+    def test_hot_dry_is_desert(self):
+        self.assertEqual(config.classify_biome(0.8, -0.5), 'DESERT')
+
+    def test_hot_wet_is_savanna(self):
+        self.assertEqual(config.classify_biome(0.8, 0.5), 'SAVANNA')
+
+    def test_returns_string(self):
+        self.assertIsInstance(config.classify_biome(0.0, 0.0), str)
+
+    def test_result_is_known_biome(self):
+        for t in [-0.8, -0.1, 0.2, 0.6]:
+            for m in [-0.8, 0.0, 0.6]:
+                b = config.classify_biome(t, m)
+                self.assertIn(b, config.BIOMES)
+
+    def test_boundary_cold_temperate(self):
+        # -0.2 is the boundary: just below = cold, at/above = temperate
+        self.assertIn(config.classify_biome(-0.21, 0.5), ('TAIGA', 'TUNDRA'))
+        self.assertIn(config.classify_biome(-0.19, 0.5), ('FOREST', 'PLAINS'))
+
+    def test_boundary_temperate_hot(self):
+        self.assertIn(config.classify_biome(0.39, 0.5), ('FOREST', 'PLAINS'))
+        self.assertIn(config.classify_biome(0.41, 0.5), ('SAVANNA', 'DESERT'))
+
+    def test_all_six_biomes_reachable(self):
+        cases = [
+            (-0.5, -0.5), (-0.5,  0.5),
+            ( 0.1, -0.5), ( 0.1,  0.5),
+            ( 0.8, -0.5), ( 0.8,  0.5),
+        ]
+        results = {config.classify_biome(t, m) for t, m in cases}
+        self.assertEqual(results, set(config.BIOMES.keys()))
+
+
+class TestBiomeConfig(unittest.TestCase):
+    """Verify biome config constants are well-formed."""
+
+    def test_has_six_biomes(self):
+        self.assertEqual(len(config.BIOMES), 6)
+
+    def test_all_expected_biomes_present(self):
+        for name in ('TUNDRA', 'TAIGA', 'PLAINS', 'FOREST', 'DESERT', 'SAVANNA'):
+            self.assertIn(name, config.BIOMES)
+
+    def test_each_biome_has_required_keys(self):
+        required = {'surface', 'subsurface', 'tree_chance',
+                    'crystal_chance', 'gravel_near_water'}
+        for name, biome in config.BIOMES.items():
+            for key in required:
+                self.assertIn(key, biome, f"Biome {name} missing key '{key}'")
+
+    def test_surface_blocks_are_valid_config_attrs(self):
+        for name, biome in config.BIOMES.items():
+            attr = biome['surface']
+            self.assertTrue(hasattr(config, attr),
+                            f"Biome {name} surface '{attr}' not in config")
+
+    def test_subsurface_blocks_are_valid_config_attrs(self):
+        for name, biome in config.BIOMES.items():
+            attr = biome['subsurface']
+            self.assertTrue(hasattr(config, attr),
+                            f"Biome {name} subsurface '{attr}' not in config")
+
+    def test_tree_chances_are_floats_in_range(self):
+        for name, biome in config.BIOMES.items():
+            tc = biome['tree_chance']
+            self.assertIsInstance(tc, float)
+            self.assertGreaterEqual(tc, 0.0)
+            self.assertLessEqual(tc, 1.0)
+
+    def test_crystal_chances_are_floats_in_range(self):
+        for name, biome in config.BIOMES.items():
+            cc = biome['crystal_chance']
+            self.assertIsInstance(cc, float)
+            self.assertGreaterEqual(cc, 0.0)
+            self.assertLessEqual(cc, 1.0)
+
+    def test_gravel_near_water_is_bool(self):
+        for name, biome in config.BIOMES.items():
+            self.assertIsInstance(biome['gravel_near_water'], bool)
+
+    def test_tundra_has_no_trees(self):
+        self.assertEqual(config.BIOMES['TUNDRA']['tree_chance'], 0.0)
+
+    def test_desert_has_no_trees(self):
+        self.assertEqual(config.BIOMES['DESERT']['tree_chance'], 0.0)
+
+    def test_forest_has_highest_tree_chance(self):
+        chances = {n: b['tree_chance'] for n, b in config.BIOMES.items()}
+        self.assertEqual(max(chances, key=chances.get), 'FOREST')
+
+    def test_desert_surface_is_sand(self):
+        self.assertEqual(config.BIOMES['DESERT']['surface'], 'SAND')
+
+    def test_tundra_surface_is_snow(self):
+        self.assertEqual(config.BIOMES['TUNDRA']['surface'], 'SNOW')
+
+    def test_biome_smoothness_positive(self):
+        self.assertGreater(config.BIOME_TEMP_SMOOTHNESS, 0)
+        self.assertGreater(config.BIOME_MOIST_SMOOTHNESS, 0)
+
+    def test_biome_seed_offsets_distinct(self):
+        self.assertNotEqual(config.BIOME_TEMP_SEED_OFFSET,
+                            config.BIOME_MOIST_SEED_OFFSET)
+
+
+class TestGetClimate(unittest.TestCase):
+    """Unit tests for NoiseGen.get_climate()."""
+
+    def setUp(self):
+        from noise_gen import NoiseGen
+        self.gen = NoiseGen(42)
+
+    def test_returns_float(self):
+        result = self.gen.get_climate(0, 0, 200)
+        self.assertIsInstance(result, float)
+
+    def test_in_range(self):
+        for x in range(-100, 100, 10):
+            for z in range(-100, 100, 10):
+                v = self.gen.get_climate(x, z, 200)
+                self.assertGreaterEqual(v, -1.0)
+                self.assertLessEqual(v, 1.0)
+
+    def test_varies_across_space(self):
+        vals = {self.gen.get_climate(x, 0, 200)
+                for x in range(-300, 300, 8)}
+        self.assertGreater(len(vals), 5,
+                           "Climate noise should vary across space")
+
+    def test_deterministic(self):
+        from noise_gen import NoiseGen
+        g2 = NoiseGen(42)
+        for x, z in [(0,0),(10,20),(-50,30)]:
+            self.assertEqual(self.gen.get_climate(x, z, 200),
+                             g2.get_climate(x, z, 200))
+
+    def test_different_smoothness_gives_different_values(self):
+        v1 = self.gen.get_climate(100, 100, 200)
+        v2 = self.gen.get_climate(100, 100, 500)
+        self.assertNotAlmostEqual(v1, v2, places=3)
+
+    def test_different_seeds_give_different_climate(self):
+        from noise_gen import NoiseGen
+        g2 = NoiseGen(999)
+        diffs = [abs(self.gen.get_climate(x, 0, 200) - g2.get_climate(x, 0, 200))
+                 for x in range(-200, 200, 20)]
+        self.assertGreater(sum(diffs), 0.1,
+                           "Different seeds should produce different climate")
+
+
+class TestBiomeGeneration(unittest.TestCase):
+    """Integration tests: biome rules applied in generate_chunk."""
+
+    def _make_model(self):
+        from noise_gen import NoiseGen
+        with patch.object(Model, '_initialize', return_value=None):
+            m = Model()
+        m.seed = 42
+        m._gen       = NoiseGen(42)
+        m._temp_gen  = NoiseGen(42 + config.BIOME_TEMP_SEED_OFFSET)
+        m._moist_gen = NoiseGen(42 + config.BIOME_MOIST_SEED_OFFSET)
+        return m
+
+    def test_desert_chunk_has_sand_surface(self):
+        """Find a desert chunk and verify its surface is sand."""
+        from noise_gen import NoiseGen
+        temp_gen  = NoiseGen(42 + config.BIOME_TEMP_SEED_OFFSET)
+        moist_gen = NoiseGen(42 + config.BIOME_MOIST_SEED_OFFSET)
+        S = config.SECTOR_SIZE
+        # Search for a desert sector
+        desert_sector = None
+        for sx in range(-10, 10):
+            for sz in range(-10, 10):
+                x, z = sx * S + S // 2, sz * S + S // 2
+                t = temp_gen.get_climate(x, z, config.BIOME_TEMP_SMOOTHNESS)
+                m = moist_gen.get_climate(x, z, config.BIOME_MOIST_SMOOTHNESS)
+                if config.classify_biome(t, m) == 'DESERT':
+                    desert_sector = (sx, sz)
+                    break
+            if desert_sector:
+                break
+        if desert_sector is None:
+            self.skipTest("No desert sector found in search range")
+        model = self._make_model()
+        sx, sz = desert_sector
+        model.generate_chunk(sx, sz)
+        surface_blocks = []
+        for (x, y, z), tex in model.world.items():
+            # Find highest block per column
+            col = (x, z)
+            surface_blocks.append((y, tex))
+        # Check no grass on very high blocks in desert (sand or snow at peak)
+        top_blocks = {}
+        for (x, y, z), tex in model.world.items():
+            if (x, z) not in top_blocks or y > top_blocks[(x, z)][0]:
+                top_blocks[(x, z)] = (y, tex)
+        non_desert_surface = [
+            tex for y, tex in top_blocks.values()
+            if tex not in (config.SAND, config.SNOW, config.LEAF, config.CRYSTAL)
+            and y > 18
+        ]
+        self.assertEqual(len(non_desert_surface), 0,
+                         "Desert surface should be sand (or snow at peaks)")
+
+    def test_tundra_has_no_trees(self):
+        """Find a tundra chunk and verify it contains no WOOD blocks."""
+        from noise_gen import NoiseGen
+        temp_gen  = NoiseGen(42 + config.BIOME_TEMP_SEED_OFFSET)
+        moist_gen = NoiseGen(42 + config.BIOME_MOIST_SEED_OFFSET)
+        S = config.SECTOR_SIZE
+        tundra_sector = None
+        for sx in range(-20, 20):
+            for sz in range(-20, 20):
+                x, z = sx * S + S // 2, sz * S + S // 2
+                t = temp_gen.get_climate(x, z, config.BIOME_TEMP_SMOOTHNESS)
+                m = moist_gen.get_climate(x, z, config.BIOME_MOIST_SMOOTHNESS)
+                if config.classify_biome(t, m) == 'TUNDRA':
+                    tundra_sector = (sx, sz)
+                    break
+            if tundra_sector:
+                break
+        if tundra_sector is None:
+            self.skipTest("No tundra sector in search range")
+        model = self._make_model()
+        sx, sz = tundra_sector
+        model.generate_chunk(sx, sz)
+        wood_blocks = [pos for pos, tex in model.world.items()
+                       if tex == config.WOOD]
+        self.assertEqual(len(wood_blocks), 0,
+                         "Tundra should have no trees")
+
+    def test_generate_chunk_uses_biome_surface(self):
+        """generate_chunk produces surface blocks consistent with biome rules."""
+        model = self._make_model()
+        S = config.SECTOR_SIZE
+        # Generate several chunks and verify each column's top block matches biome
+        for sx, sz in [(0,0),(1,0),(0,1),(-1,0)]:
+            model.generate_chunk(sx, sz)
+
+        valid_surfaces = [config.GRASS, config.SNOW, config.SAND,
+                          config.GRAVEL, config.LEAF]
+        top_blocks = {}
+        for (x, y, z), tex in model.world.items():
+            if (x, z) not in top_blocks or y > top_blocks[(x, z)][0]:
+                top_blocks[(x, z)] = (y, tex)
+
+        for (x, z), (y, tex) in top_blocks.items():
+            if y >= 18:
+                self.assertIn(tex, valid_surfaces,
+                              f"Unexpected surface block {tex} at ({x},{y},{z})")
+
+    def test_water_fills_low_areas_regardless_of_biome(self):
+        """Low-height columns should have water regardless of biome."""
+        model = self._make_model()
+        model.generate_chunk(0, 0)
+        has_water = any(
+            tex in (config.WATER, config.MAGIC_WATER)
+            for tex in model.world.values()
+        )
+        # Not guaranteed in every chunk but should exist somewhere nearby
+        for sx in range(-3, 3):
+            for sz in range(-3, 3):
+                model.generate_chunk(sx, sz)
+        has_water = any(
+            tex in (config.WATER, config.MAGIC_WATER)
+            for tex in model.world.values()
+        )
+        self.assertTrue(has_water, "Expected water somewhere in generated area")
+
+    def test_biome_chunks_are_deterministic(self):
+        """Same seed + same chunk coords = identical world state."""
+        m1 = self._make_model()
+        m2 = self._make_model()
+        for sx, sz in [(0,0),(1,1),(-1,0)]:
+            m1.generate_chunk(sx, sz)
+            m2.generate_chunk(sx, sz)
+        self.assertEqual(set(m1.world.keys()), set(m2.world.keys()))
+
+
+# ===========================================================================
+# Sound system
+# ===========================================================================
+
+class TestSoundSynthesis(unittest.TestCase):
+    """Test procedural sound generation — pure Python, no audio device needed."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_generate_sounds_creates_directory(self):
+        from sounds import generate_sounds
+        target = os.path.join(self.tmp, 'sounds')
+        generate_sounds(target)
+        self.assertTrue(os.path.isdir(target))
+
+    def test_generate_sounds_creates_all_wavs(self):
+        from sounds import generate_sounds, _SOUND_DEFS
+        generate_sounds(self.tmp)
+        for name in _SOUND_DEFS:
+            path = os.path.join(self.tmp, f'{name}.wav')
+            self.assertTrue(os.path.exists(path), f"Missing {name}.wav")
+
+    def test_wav_files_are_valid(self):
+        from sounds import generate_sounds, _SOUND_DEFS
+        generate_sounds(self.tmp)
+        for name in _SOUND_DEFS:
+            path = os.path.join(self.tmp, f'{name}.wav')
+            with wave.open(path, 'r') as w:
+                self.assertEqual(w.getnchannels(), 1)
+                self.assertEqual(w.getsampwidth(), 2)
+                self.assertEqual(w.getframerate(), 22050)
+                self.assertGreater(w.getnframes(), 0)
+
+    def test_wav_sample_count_matches_duration(self):
+        from sounds import generate_sounds, _SOUND_DEFS, SAMPLE_RATE
+        generate_sounds(self.tmp)
+        for name, (fn, dur, vol, seed) in _SOUND_DEFS.items():
+            path = os.path.join(self.tmp, f'{name}.wav')
+            with wave.open(path, 'r') as w:
+                expected = int(SAMPLE_RATE * dur)
+                self.assertEqual(w.getnframes(), expected,
+                                 f"{name}: wrong frame count")
+
+    def test_samples_within_int16_range(self):
+        from sounds import generate_sounds, _SOUND_DEFS
+        generate_sounds(self.tmp)
+        for name in list(_SOUND_DEFS.keys())[:4]:   # spot-check a few
+            path = os.path.join(self.tmp, f'{name}.wav')
+            with wave.open(path, 'r') as w:
+                raw = w.readframes(w.getnframes())
+            samples = struct.unpack(f'<{len(raw)//2}h', raw)
+            self.assertLessEqual(max(abs(s) for s in samples), 32767)
+
+    def test_generate_sounds_is_idempotent(self):
+        from sounds import generate_sounds
+        generate_sounds(self.tmp)
+        mtime_before = {
+            f: os.path.getmtime(os.path.join(self.tmp, f))
+            for f in os.listdir(self.tmp)
+        }
+        import time; time.sleep(0.05)
+        generate_sounds(self.tmp)   # should not overwrite existing files
+        for f, mtime in mtime_before.items():
+            self.assertEqual(os.path.getmtime(os.path.join(self.tmp, f)),
+                             mtime, f"{f} was overwritten on second call")
+
+    def test_break_and_place_variants_exist(self):
+        from sounds import _SOUND_DEFS
+        categories = {'stone', 'dirt', 'wood', 'glass', 'leaf', 'water', 'sand'}
+        for cat in categories:
+            self.assertIn(f'{cat}_break', _SOUND_DEFS,
+                          f"Missing {cat}_break")
+            self.assertIn(f'{cat}_place', _SOUND_DEFS,
+                          f"Missing {cat}_place")
+
+    def test_stone_synth_returns_correct_length(self):
+        from sounds import _stone, SAMPLE_RATE
+        dur = 0.10
+        samples = _stone(dur, 0.7, seed=0)
+        self.assertEqual(len(samples), int(SAMPLE_RATE * dur))
+
+    def test_all_synth_functions_return_floats(self):
+        from sounds import _stone, _dirt, _wood, _glass, _leaf, _water
+        for fn in (_stone, _dirt, _wood, _glass, _leaf, _water):
+            samples = fn(0.05, 0.5, seed=0)
+            self.assertTrue(all(isinstance(s, float) for s in samples))
+
+    def test_all_synth_samples_in_range(self):
+        from sounds import _stone, _dirt, _wood, _glass, _leaf, _water
+        for fn in (_stone, _dirt, _wood, _glass, _leaf, _water):
+            samples = fn(0.05, 0.5, seed=0)
+            for s in samples:
+                self.assertGreaterEqual(s, -1.0)
+                self.assertLessEqual(s, 1.0)
+
+
+class TestSoundConfig(unittest.TestCase):
+    """Verify BLOCK_SOUND_MAP is complete and consistent."""
+
+    def test_block_sound_map_has_14_entries(self):
+        self.assertEqual(len(config.BLOCK_SOUND_MAP), 14)
+
+    def test_all_block_types_in_map(self):
+        all_blocks = [
+            config.GRASS, config.SAND, config.BRICK, config.STONE,
+            config.WOOD, config.LEAF, config.WATER, config.CRYSTAL,
+            config.MAGIC_WATER, config.DIRT, config.SNOW,
+            config.GLASS, config.PLANKS, config.GRAVEL,
+        ]
+        for block in all_blocks:
+            self.assertIn(tuple(block), config.BLOCK_SOUND_MAP,
+                          f"Block missing from BLOCK_SOUND_MAP")
+
+    def test_all_categories_are_valid(self):
+        valid = {'stone', 'dirt', 'sand', 'wood', 'glass', 'leaf', 'water'}
+        for tex_key, category in config.BLOCK_SOUND_MAP.items():
+            self.assertIn(category, valid,
+                          f"Unknown sound category '{category}'")
+
+    def test_stone_maps_to_stone(self):
+        self.assertEqual(config.BLOCK_SOUND_MAP[tuple(config.STONE)], 'stone')
+
+    def test_water_maps_to_water(self):
+        self.assertEqual(config.BLOCK_SOUND_MAP[tuple(config.WATER)], 'water')
+
+    def test_wood_maps_to_wood(self):
+        self.assertEqual(config.BLOCK_SOUND_MAP[tuple(config.WOOD)], 'wood')
+
+    def test_glass_maps_to_glass(self):
+        self.assertEqual(config.BLOCK_SOUND_MAP[tuple(config.GLASS)], 'glass')
+
+    def test_sound_names_resolve_to_wav_defs(self):
+        from sounds import _SOUND_DEFS
+        for category in set(config.BLOCK_SOUND_MAP.values()):
+            self.assertIn(f'{category}_break', _SOUND_DEFS)
+            self.assertIn(f'{category}_place', _SOUND_DEFS)
+
+
+class TestSoundManager(unittest.TestCase):
+    """Test SoundManager with mocked pyglet.media."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_manager(self):
+        from sounds import SoundManager
+        return SoundManager(sounds_dir=self.tmp)
+
+    def test_manager_loads_without_error(self):
+        sm = self._make_manager()
+        self.assertIsNotNone(sm)
+
+    def test_available_sounds_not_empty(self):
+        sm = self._make_manager()
+        self.assertGreater(len(sm.available_sounds()), 0)
+
+    def test_play_known_sound_no_error(self):
+        sm = self._make_manager()
+        sm.play('stone_break')   # should not raise
+
+    def test_play_unknown_sound_no_error(self):
+        sm = self._make_manager()
+        sm.play('nonexistent_sound')   # should not raise
+
+    def test_play_when_disabled_no_error(self):
+        sm = self._make_manager()
+        sm._enabled = False
+        sm.play('stone_break')   # should not raise
+
+    def test_all_expected_sounds_loaded(self):
+        from sounds import _SOUND_DEFS
+        sm = self._make_manager()
+        for name in _SOUND_DEFS:
+            self.assertIn(name, sm.available_sounds(),
+                          f"Sound '{name}' not loaded")
+
+    def test_wavs_generated_in_sounds_dir(self):
+        from sounds import _SOUND_DEFS
+        self._make_manager()
+        for name in _SOUND_DEFS:
+            path = os.path.join(self.tmp, f'{name}.wav')
+            self.assertTrue(os.path.exists(path))

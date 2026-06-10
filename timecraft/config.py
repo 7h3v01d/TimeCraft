@@ -280,3 +280,115 @@ BLOCK_IDS = [
 # ---------------------------------------------------------------------------
 RENDER_DISTANCE = 4   # sectors around player to keep shown (radius)
 EVICT_DISTANCE  = 6   # sectors beyond which blocks are unloaded from world dict
+
+# ---------------------------------------------------------------------------
+# Biome system
+# ---------------------------------------------------------------------------
+
+# Climate noise smoothness — larger = broader biome patches
+BIOME_TEMP_SMOOTHNESS  = 200   # temperature varies over ~200 block scale
+BIOME_MOIST_SMOOTHNESS = 250   # moisture on a slightly different scale
+
+# Seed offsets for climate noise generators (added to world seed)
+BIOME_TEMP_SEED_OFFSET  = 100
+BIOME_MOIST_SEED_OFFSET = 200
+
+# Biome definitions.  Each entry is a dict with:
+#   surface      — block placed at the top exposed column
+#   subsurface   — block placed 1-3 layers below surface (replaces STONE)
+#   tree_chance  — probability per column of a tree spawning (0 = none)
+#   crystal_chance — probability of a crystal formation on high ground
+#   gravel_near_water — whether to place gravel near water edges
+BIOMES = {
+    'TUNDRA': {
+        'surface':           'SNOW',
+        'subsurface':        'STONE',
+        'tree_chance':       0.000,
+        'crystal_chance':    0.001,
+        'gravel_near_water': False,
+    },
+    'TAIGA': {
+        'surface':           'SNOW',
+        'subsurface':        'DIRT',
+        'tree_chance':       0.006,
+        'crystal_chance':    0.000,
+        'gravel_near_water': False,
+    },
+    'PLAINS': {
+        'surface':           'GRASS',
+        'subsurface':        'DIRT',
+        'tree_chance':       0.003,
+        'crystal_chance':    0.000,
+        'gravel_near_water': True,
+    },
+    'FOREST': {
+        'surface':           'GRASS',
+        'subsurface':        'DIRT',
+        'tree_chance':       0.018,
+        'crystal_chance':    0.000,
+        'gravel_near_water': True,
+    },
+    'DESERT': {
+        'surface':           'SAND',
+        'subsurface':        'SAND',
+        'tree_chance':       0.000,
+        'crystal_chance':    0.004,   # crystals as cactus stand-in
+        'gravel_near_water': False,
+    },
+    'SAVANNA': {
+        'surface':           'GRASS',
+        'subsurface':        'SAND',
+        'tree_chance':       0.005,
+        'crystal_chance':    0.000,
+        'gravel_near_water': True,
+    },
+}
+
+
+def classify_biome(temp, moist):
+    """Return a biome name string from temperature and moisture values in [-1, 1].
+
+    Thresholds chosen to give roughly equal representation across biomes:
+      temp < -0.2              → cold   (tundra/taiga)
+      -0.2 <= temp < 0.4       → temperate (plains/forest)
+      temp >= 0.4              → hot    (desert/savanna)
+      moist threshold at 0.1 (cold) and 0.0 (temperate) and 0.2 (hot)
+    """
+    if temp < -0.2:
+        return 'TAIGA' if moist > 0.1 else 'TUNDRA'
+    elif temp < 0.4:
+        return 'FOREST' if moist > 0.0 else 'PLAINS'
+    else:
+        return 'DESERT' if moist < 0.2 else 'SAVANNA'
+
+# ---------------------------------------------------------------------------
+# Sound system
+# ---------------------------------------------------------------------------
+
+# Maps block texture list (as tuple) → sound category name.
+# Each category has a _break and _place variant in sounds.py.
+BLOCK_SOUND_MAP = {}   # populated by _build_sound_map() below
+
+
+def _build_sound_map():
+    pairs = [
+        (GRASS,        'dirt'),
+        (DIRT,         'dirt'),
+        (SAND,         'sand'),
+        (GRAVEL,       'sand'),
+        (STONE,        'stone'),
+        (BRICK,        'stone'),
+        (CRYSTAL,      'glass'),
+        (GLASS,        'glass'),
+        (MAGIC_WATER,  'water'),
+        (WATER,        'water'),
+        (WOOD,         'wood'),
+        (PLANKS,       'wood'),
+        (LEAF,         'leaf'),
+        (SNOW,         'dirt'),
+    ]
+    for tex, category in pairs:
+        BLOCK_SOUND_MAP[tuple(tex)] = category
+
+
+_build_sound_map()

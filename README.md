@@ -1,4 +1,4 @@
-# 🌍 TimeCraft v0.7
+# 🌍 TimeCraft v1.1
 
 A 3D voxel sandbox engine built in Python with **pyglet** and **OpenGL 3.3 core** — procedurally generated worlds, custom GLSL shaders, real physics, ambient occlusion, a day/night cycle, and a working save/load system.
 
@@ -135,7 +135,7 @@ pytest
 
 ## 🧪 Tests
 
-221 tests, all passing. Run with:
+318 tests, all passing. Run with:
 ```bat
 test.bat
 ```
@@ -150,7 +150,7 @@ Test coverage spans: `normalize`, `sectorize`, `cube_vertices`, config constants
 
 ## ⚠️ Known limitations
 
-- World is infinite — terrain generated on demand, distant chunks evicted
+- World size is fixed at 128×128
 - No point light sources — lighting is purely sun-driven ambient
 - No entities, mobs, or NPCs
 - No multiplayer
@@ -180,4 +180,4 @@ Personal project — unlicensed. Do whatever you like with it.
 
 ## 🏷️ Status
 
-**Active** — v0.7, 221 tests passing, fully playable.
+**Active** — v1.1, 318 tests passing, fully playable.

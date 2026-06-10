@@ -205,7 +205,9 @@ class Model(object):
             self.load_world()
         else:
             self.seed = random.randint(0, 1_000_000)
-            self._gen = NoiseGen(self.seed)
+            self._gen        = NoiseGen(self.seed)
+            self._temp_gen   = NoiseGen(self.seed + config.BIOME_TEMP_SEED_OFFSET)
+            self._moist_gen  = NoiseGen(self.seed + config.BIOME_MOIST_SEED_OFFSET)
             # Generate a small area around the origin for the spawn region
             for sx in range(-1, 2):
                 for sz in range(-1, 2):
@@ -216,8 +218,14 @@ class Model(object):
 
         Covers world columns (sx*S .. sx*S+S-1, sz*S .. sz*S+S-1) where
         S = SECTOR_SIZE.  Skips silently if the chunk was already generated
-        or if this world was loaded from a save (in which case the saved
-        block state is authoritative).
+        or if this world was loaded from a save.
+
+        Terrain is driven by three noise passes:
+          _gen       — height (topography)
+          _temp_gen  — temperature (cold to hot)
+          _moist_gen — moisture (dry to wet)
+        The temperature/moisture pair classifies each column into a biome
+        which controls surface block, subsurface fill, tree density, etc.
         """
         if (sx, sz) in self.generated_chunks:
             return
@@ -226,7 +234,7 @@ class Model(object):
         if not hasattr(self, '_gen') or self._gen is None:
             return   # loaded world — don't overwrite saved blocks
 
-        S = config.SECTOR_SIZE
+        S   = config.SECTOR_SIZE
         rng = random.Random(self.seed ^ (sx * 73856093) ^ (sz * 19349663))
 
         for lx in range(S):
@@ -235,22 +243,52 @@ class Model(object):
                 z = sz * S + lz
                 h = max(1, int(self._gen.getHeight(x, z)))
 
+                # Classify biome from climate noise
+                temp  = self._temp_gen.get_climate(
+                    x, z, config.BIOME_TEMP_SMOOTHNESS)
+                moist = self._moist_gen.get_climate(
+                    x, z, config.BIOME_MOIST_SMOOTHNESS)
+                biome_name  = config.classify_biome(temp, moist)
+                biome       = config.BIOMES[biome_name]
+                surface_tex = getattr(config, biome['surface'])
+                sub_tex     = getattr(config, biome['subsurface'])
+
+                # --- Water / beach zone (height-driven, biome-independent) ---
                 if h < 15:
                     self.add_block((x, h, z), config.SAND, immediate=False)
                     for y in range(h, 15):
                         self.add_block((x, y, z),
-                            config.MAGIC_WATER if rng.random() > 0.99 else config.WATER,
+                            config.MAGIC_WATER if rng.random() > 0.99
+                            else config.WATER,
                             immediate=False)
                     continue
 
                 if h < 18:
                     self.add_block((x, h, z), config.SAND, immediate=False)
+                    continue
 
-                self.add_block((x, h, z), config.GRASS, immediate=False)
+                # --- Surface block ---
+                # High peaks always cap with snow regardless of biome
+                if h > 30:
+                    self.add_block((x, h, z), config.SNOW, immediate=False)
+                else:
+                    self.add_block((x, h, z), surface_tex, immediate=False)
+
+                # --- Stone fill below surface ---
                 for y in range(h - 1, 0, -1):
                     self.add_block((x, y, z), config.STONE, immediate=False)
 
-                if h > 20 and rng.random() > 0.99:
+                # --- Subsurface layer (replaces top stone with biome material) ---
+                if sub_tex != config.STONE:
+                    for dy in range(1, min(4, h)):
+                        b = (x, h - dy, z)
+                        if b in self.world and self.world[b] == config.STONE:
+                            self.add_block(b, sub_tex, immediate=False)
+                            break
+
+                # --- Trees ---
+                tree_chance = biome['tree_chance']
+                if tree_chance > 0 and h > 20 and rng.random() < tree_chance:
                     tree_h = rng.randint(5, 7)
                     for y in range(h + 1, h + tree_h):
                         self.add_block((x, y, z), config.WOOD, immediate=False)
@@ -263,21 +301,17 @@ class Model(object):
                                     self.add_block((lx2, leafh + ly, lz2),
                                                    config.LEAF, immediate=False)
 
-                if h > 18:
-                    for dy in range(1, min(4, h)):
-                        b = (x, h - dy, z)
-                        if b in self.world and self.world[b] == config.STONE:
-                            self.add_block(b, config.DIRT, immediate=False)
-                            break
-
-                if h > 30:
-                    self.add_block((x, h, z), config.SNOW, immediate=False)
-
-                if 18 <= h <= 20 and rng.random() > 0.6:
+                # --- Gravel near water edges ---
+                if biome['gravel_near_water'] and 18 <= h <= 20 \
+                        and rng.random() > 0.6:
                     self.add_block((x, h, z), config.GRAVEL, immediate=False)
 
-                if h > 25 and rng.random() > 0.995:
-                    self.add_block((x, h - 1, z), config.CRYSTAL, immediate=False)
+                # --- Crystal formations ---
+                crystal_chance = biome['crystal_chance']
+                if crystal_chance > 0 and h > 20 \
+                        and rng.random() < crystal_chance:
+                    self.add_block((x, h - 1, z), config.CRYSTAL,
+                                   immediate=False)
 
     # ------------------------------------------------------------------
     # Spawn point
@@ -351,7 +385,7 @@ class Model(object):
 
     def _load_binary(self, path):
         """Read a .tcw binary save file."""
-        self._gen = None   # saved state is authoritative — no terrain overwrite
+        self._gen = self._temp_gen = self._moist_gen = None  # saved state is authoritative
         with open(path, 'rb') as f:
             magic, version, seed, count = _HEADER_FMT.unpack(
                 f.read(_HEADER_FMT.size))
@@ -367,7 +401,7 @@ class Model(object):
 
     def _load_json_legacy(self, path):
         """Read a legacy JSON save (pre-v0.8).  Used for one-time migration."""
-        self._gen = None   # saved state is authoritative
+        self._gen = self._temp_gen = self._moist_gen = None  # saved state is authoritative
         with open(path, 'r') as f:
             data = json.load(f)
         self.seed = data.get('seed')
